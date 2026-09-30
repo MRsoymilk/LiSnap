@@ -64,7 +64,7 @@ sh scripts/check-core.sh
 
 ### 当前验证结果
 
-在本机 Linux / rustc 1.97.1 上，Cargo 依赖已经解析并生成 `Cargo.lock`；格式检查、19 个离线核心/CLI 测试、无显示服务器的一帧 egui UI 布局 smoke test、完整 workspace `cargo check`、`cargo clippy -D warnings` 以及带 GUI 特性的二进制编译/链接和 `--version` 运行均已通过。当前自动化执行环境没有 `WAYLAND_DISPLAY`、`WAYLAND_SOCKET` 或 `DISPLAY`，因此真正创建桌面窗口的运行验证仍待在图形会话中完成；Windows/macOS 构建验证也仍待完成。
+在本机 Linux / rustc 1.97.1 上，Cargo 依赖已经解析并生成 `Cargo.lock`；格式检查、19 个离线核心/CLI 测试、无显示服务器的一帧 egui UI 布局 smoke test、完整 workspace `cargo check`、`cargo clippy -D warnings` 以及带 GUI 特性的二进制编译/链接和 `--version` 运行均已通过。自动化 shell 本身没有继承桌面环境变量，但 `/run/user/1000/wayland-1` 可访问；显式设置 `XDG_RUNTIME_DIR=/run/user/1000` 与 `WAYLAND_DISPLAY=wayland-1` 后，完整 GUI 二进制持续运行 5 秒且无启动错误，因此 Linux/Wayland 原生窗口启动已验证。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后才能验收这两项。
 
 ## 当前范围
 
