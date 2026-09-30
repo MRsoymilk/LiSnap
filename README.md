@@ -64,7 +64,7 @@ sh scripts/check-core.sh
 
 ### 当前验证结果
 
-在本机 Linux / rustc 1.97.1 上，格式检查、19 个离线测试以及 CLI 版本/后端清单运行已通过。crates.io 索引更新超时，本机缓存缺少 egui，因此完整 Cargo 依赖解析、GUI 编译与运行、Windows/macOS 构建尚未通过验证。Cargo.lock 待首次成功解析依赖后生成并纳入版本管理。
+在本机 Linux / rustc 1.97.1 上，Cargo 依赖已经解析并生成 `Cargo.lock`；格式检查、19 个离线测试、完整 workspace `cargo check`、`cargo clippy -D warnings` 以及带 GUI 特性的二进制编译/链接和 `--version` 运行均已通过。当前自动化执行环境没有 `WAYLAND_DISPLAY`、`WAYLAND_SOCKET` 或 `DISPLAY`，因此真正创建桌面窗口的运行验证仍待在图形会话中完成；Windows/macOS 构建验证也仍待完成。
 
 ## 当前范围
 

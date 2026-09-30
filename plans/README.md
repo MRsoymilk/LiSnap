@@ -9,8 +9,9 @@
 - [x] Wayland、X11、Windows、macOS 模块和明确失败的占位实现。
 - [x] CLI 参数、后端清单、无 GUI 构建入口。
 - [x] 本机离线 19 项测试通过，CLI 编译与版本/清单运行通过。
-- [ ] 完成 Cargo 依赖解析并生成 Cargo.lock；当前 crates.io 索引更新超时，缓存缺少 egui。
-- [ ] 完整 Cargo check/clippy 与 GUI 启动验证。
+- [x] 完成 Cargo 依赖解析并生成 Cargo.lock。
+- [x] 本机完整 `cargo check --workspace --all-targets` 与 `cargo clippy --workspace --all-targets -- -D warnings`。
+- [ ] GUI 真正启动验证；当前自动化执行环境没有 `WAYLAND_DISPLAY` / `WAYLAND_SOCKET` / `DISPLAY`，只能验证完整 GUI 二进制可编译、链接并运行 `--version`。
 - [ ] Windows/macOS 构建验证。
 
 优先完成 S0 剩余验收，不把源码框架或环境变量推断计为真实截图支持。
