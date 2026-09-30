@@ -1,0 +1,19 @@
+[package]
+name = "lisnap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "LiSnap cross-platform screenshot tool"
+
+[features]
+default = ["gui"]
+gui = ["dep:lisnap-ui"]
+
+[dependencies]
+lisnap-core.workspace = true
+lisnap-platform.workspace = true
+lisnap-ui = { workspace = true, optional = true }
+
+[lints]
+workspace = true

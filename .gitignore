@@ -1,0 +1,10 @@
+/target/
+/build/
+/out/
+/.cache/
+/.ai-bridge/
+/.idea/
+/.vscode/
+*.swp
+.DS_Store
+Thumbs.db

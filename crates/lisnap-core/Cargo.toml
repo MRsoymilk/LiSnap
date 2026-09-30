@@ -1,0 +1,12 @@
+[package]
+name = "lisnap-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "UI-independent capture types, immutable pixels, and selection geometry"
+
+[dependencies]
+
+[lints]
+workspace = true
