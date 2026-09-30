@@ -11,6 +11,7 @@
 - [x] 本机离线 19 项测试通过，CLI 编译与版本/清单运行通过。
 - [x] 完成 Cargo 依赖解析并生成 Cargo.lock。
 - [x] 本机完整 `cargo check --workspace --all-targets` 与 `cargo clippy --workspace --all-targets -- -D warnings`。
+- [x] 无显示服务器环境下执行一帧 egui UI 布局 smoke test。
 - [ ] GUI 真正启动验证；当前自动化执行环境没有 `WAYLAND_DISPLAY` / `WAYLAND_SOCKET` / `DISPLAY`，只能验证完整 GUI 二进制可编译、链接并运行 `--version`。
 - [ ] Windows/macOS 构建验证。
 

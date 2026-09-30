@@ -68,3 +68,21 @@ impl eframe::App for LiSnapApp {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_renders_without_native_window() {
+        let context = egui::Context::default();
+        let mut app = LiSnapApp::new(None, Vec::new());
+
+        let mut output = context.run_ui(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| app.overview(ui));
+        });
+
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
+    }
+}
