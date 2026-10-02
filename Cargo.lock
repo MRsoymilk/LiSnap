@@ -1173,6 +1173,7 @@ name = "lisnap-platform"
 version = "0.1.0"
 dependencies = [
  "lisnap-core",
+ "rustix 1.1.5",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",

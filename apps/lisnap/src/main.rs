@@ -48,6 +48,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Action::ProbeWayland => print_wayland_probe(cli.wayland_socket.as_deref()),
+        Action::CaptureWlr => run_wlr_capture(&cli),
         Action::Gui => launch_gui(cli.backend.or_else(default_backend)),
     }
 }
@@ -98,6 +99,42 @@ fn print_wayland_probe(socket: Option<&str>) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn print_wayland_probe(_socket: Option<&str>) -> Result<(), String> {
     Err("--probe-wayland is only available on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn run_wlr_capture(cli: &Cli) -> Result<(), String> {
+    let request = lisnap_core::CaptureRequest { screen_id: cli.screen_id.clone(), include_cursor: cli.include_cursor };
+    let frames = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::capture_wayland_wlr_socket(std::path::Path::new(path), &request),
+        None => lisnap_platform::capture_wayland_wlr(&request),
+    }
+    .map_err(|error| error.to_string())?;
+    if frames.is_empty() {
+        return Err("wlr-screencopy returned no frames".into());
+    }
+    for frame in frames {
+        let size = frame.image.size();
+        let pixels = frame.image.pixels();
+        println!(
+            "{} | {}x{} | {} RGBA bytes | fnv64 {:016x}",
+            frame.screen.id,
+            size.width,
+            size.height,
+            pixels.len(),
+            fnv1a64(pixels)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_wlr_capture(_cli: &Cli) -> Result<(), String> {
+    Err("--capture-wlr is only available on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
 }
 
 #[cfg(target_os = "linux")]

@@ -1,7 +1,9 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
+mod wlr;
+
 use std::{collections::BTreeMap, os::unix::net::UnixStream, path::Path};
 
-use lisnap_core::{CaptureBackend, CaptureError};
+use lisnap_core::{CaptureBackend, CaptureError, CaptureFrame, CaptureRequest};
 use wayland_client::{
     Connection, Dispatch, QueueHandle,
     protocol::{wl_output, wl_registry},
@@ -277,11 +279,25 @@ pub fn probe() -> Result<WaylandProbe, CaptureError> {
 }
 
 pub fn probe_socket(path: &Path) -> Result<WaylandProbe, CaptureError> {
+    let connection = connect_socket(path)?;
+    probe_connection(connection)
+}
+
+pub fn capture_wlr(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    wlr::capture_connection(connection, request)
+}
+
+pub fn capture_wlr_socket(path: &Path, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+    wlr::capture_connection(connect_socket(path)?, request)
+}
+
+fn connect_socket(path: &Path) -> Result<Connection, CaptureError> {
     let socket = UnixStream::connect(path)
         .map_err(|error| CaptureError::BackendFailure(format!("Wayland socket {} failed: {error}", path.display())))?;
-    let connection = Connection::from_socket(socket)
-        .map_err(|error| CaptureError::BackendFailure(format!("Wayland socket handshake failed: {error}")))?;
-    probe_connection(connection)
+    Connection::from_socket(socket)
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland socket handshake failed: {error}")))
 }
 
 fn probe_connection(connection: Connection) -> Result<WaylandProbe, CaptureError> {
