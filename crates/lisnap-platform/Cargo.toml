@@ -9,5 +9,8 @@ description = "Native screenshot backend boundaries; no Portal capture dependenc
 [dependencies]
 lisnap-core.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31.15"
+
 [lints]
 workspace = true

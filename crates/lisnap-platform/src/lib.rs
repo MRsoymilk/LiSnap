@@ -5,6 +5,10 @@ use lisnap_core::{BackendDescriptor, BackendStatus, CaptureBackend, CaptureError
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::wayland::{
+    WaylandCaptureProtocol, WaylandOutput, WaylandProbe, probe as probe_wayland, probe_socket as probe_wayland_socket,
+};
 #[cfg(target_os = "macos")]
 mod macos;
 mod stub;

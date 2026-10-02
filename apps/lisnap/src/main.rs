@@ -47,8 +47,59 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
+        Action::ProbeWayland => print_wayland_probe(cli.wayland_socket.as_deref()),
         Action::Gui => launch_gui(cli.backend.or_else(default_backend)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn print_wayland_probe(socket: Option<&str>) -> Result<(), String> {
+    let probe = match socket {
+        Some(path) => lisnap_platform::probe_wayland_socket(std::path::Path::new(path)),
+        None => lisnap_platform::probe_wayland(),
+    }
+    .map_err(|error| error.to_string())?;
+    println!("Wayland outputs: {}", probe.outputs.len());
+    for output in &probe.outputs {
+        println!(
+            "output {} | {} | wl_output v{} | scale {}",
+            output.global_name,
+            output.name.as_deref().unwrap_or("<unnamed>"),
+            output.protocol_version,
+            output.scale_factor.map_or_else(|| "unknown".into(), |scale| scale.to_string())
+        );
+        if let Some(description) = output.description.as_deref() {
+            println!("  description: {description}");
+        }
+        if output.make.is_some() || output.model.is_some() {
+            println!(
+                "  device: {} {}",
+                output.make.as_deref().unwrap_or("<unknown make>"),
+                output.model.as_deref().unwrap_or("<unknown model>")
+            );
+        }
+    }
+    println!("ext-image-copy-capture manager: {}", protocol_version(probe.ext_image_copy_capture_manager_version));
+    println!(
+        "ext-output-image-capture-source manager: {}",
+        protocol_version(probe.ext_output_image_capture_source_manager_version)
+    );
+    println!("wlr-screencopy manager: {}", protocol_version(probe.wlr_screencopy_manager_version));
+    println!(
+        "preferred direct capture protocol: {}",
+        probe.preferred_capture_protocol().map_or_else(|| "none".into(), |protocol| protocol.to_string())
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn print_wayland_probe(_socket: Option<&str>) -> Result<(), String> {
+    Err("--probe-wayland is only available on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn protocol_version(version: Option<u32>) -> String {
+    version.map_or_else(|| "unavailable".into(), |version| format!("v{version}"))
 }
 
 #[cfg(feature = "gui")]
