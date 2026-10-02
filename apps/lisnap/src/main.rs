@@ -85,6 +85,7 @@ fn print_wayland_probe(socket: Option<&str>) -> Result<(), String> {
         protocol_version(probe.ext_output_image_capture_source_manager_version)
     );
     println!("wlr-screencopy manager: {}", protocol_version(probe.wlr_screencopy_manager_version));
+    println!("wlr-screencopy manager bound: {}", probe.wlr_screencopy_manager_bound);
     println!(
         "preferred direct capture protocol: {}",
         probe.preferred_capture_protocol().map_or_else(|| "none".into(), |protocol| protocol.to_string())

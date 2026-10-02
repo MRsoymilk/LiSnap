@@ -6,10 +6,12 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle,
     protocol::{wl_output, wl_registry},
 };
+use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
 
 use crate::{BackendKind, stub::StubBackend};
 
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
+const WLR_SCREENCOPY_MANAGER_MAX_VERSION: u32 = 3;
 const EXT_IMAGE_COPY_CAPTURE_MANAGER: &str = "ext_image_copy_capture_manager_v1";
 const EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER: &str = "ext_output_image_capture_source_manager_v1";
 const WLR_SCREENCOPY_MANAGER: &str = "zwlr_screencopy_manager_v1";
@@ -46,6 +48,7 @@ pub struct WaylandProbe {
     pub ext_image_copy_capture_manager_version: Option<u32>,
     pub ext_output_image_capture_source_manager_version: Option<u32>,
     pub wlr_screencopy_manager_version: Option<u32>,
+    pub wlr_screencopy_manager_bound: bool,
 }
 
 impl WaylandProbe {
@@ -74,6 +77,7 @@ struct ProbeState {
     ext_image_copy_capture_manager_version: Option<u32>,
     ext_output_image_capture_source_manager_version: Option<u32>,
     wlr_screencopy_manager_version: Option<u32>,
+    wlr_screencopy_manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
 }
 
 impl ProbeState {
@@ -93,6 +97,7 @@ impl ProbeState {
             ext_image_copy_capture_manager_version: self.ext_image_copy_capture_manager_version,
             ext_output_image_capture_source_manager_version: self.ext_output_image_capture_source_manager_version,
             wlr_screencopy_manager_version: self.wlr_screencopy_manager_version,
+            wlr_screencopy_manager_bound: self.wlr_screencopy_manager.is_some(),
         }
     }
 }
@@ -114,6 +119,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ProbeState {
         match event {
             wl_registry::Event::Global { name, interface, version } => {
                 state.record_global(&interface, version);
+                if interface == WLR_SCREENCOPY_MANAGER {
+                    let proxy = registry.bind::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _, _>(
+                        name,
+                        version.min(WLR_SCREENCOPY_MANAGER_MAX_VERSION),
+                        queue_handle,
+                        (),
+                    );
+                    state.wlr_screencopy_manager = Some(proxy);
+                }
                 if interface == "wl_output" {
                     let bind_version = version.min(WL_OUTPUT_MAX_VERSION);
                     let proxy = registry.bind::<wl_output::WlOutput, _, _>(
@@ -144,6 +158,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ProbeState {
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _manager: &zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+        _event: zwlr_screencopy_manager_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -236,5 +262,6 @@ mod tests {
         let probe = state.finish();
         assert_eq!(probe.preferred_capture_protocol(), Some(WaylandCaptureProtocol::WlrScreencopy));
         assert_eq!(probe.wlr_screencopy_manager_version, Some(3));
+        assert!(!probe.wlr_screencopy_manager_bound);
     }
 }

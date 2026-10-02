@@ -1174,6 +1174,7 @@ version = "0.1.0"
 dependencies = [
  "lisnap-core",
  "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]
