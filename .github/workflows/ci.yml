@@ -32,3 +32,5 @@ jobs:
         with:
           toolchain: "1.97"
       - run: cargo check --workspace --all-targets
+      - run: cargo test -p lisnap-platform
+      - run: cargo test -p lisnap --no-default-features

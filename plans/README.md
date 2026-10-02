@@ -13,7 +13,7 @@
 - [x] 本机完整 `cargo check --workspace --all-targets` 与 `cargo clippy --workspace --all-targets -- -D warnings`。
 - [x] 无显示服务器环境下执行一帧 egui UI 布局 smoke test。
 - [x] GUI 真正启动验证：通过显式连接现有 `/run/user/1000/wayland-1`，完整 GUI 二进制在 Wayland 会话中持续运行 5 秒且无启动错误。
-- [ ] Windows/macOS 构建验证；本机未安装对应 Rust target，已加入原生 GitHub Actions 构建矩阵，待远端实际运行后验收。
+- [ ] Windows/macOS 构建验证；本机未安装对应 Rust target，已加入原生 GitHub Actions 构建矩阵，并要求各原生 runner 执行 workspace check、平台后端测试和无 GUI CLI 测试，待远端实际运行后验收。
 
 优先完成 S0 剩余验收，不把源码框架或环境变量推断计为真实截图支持。
 
