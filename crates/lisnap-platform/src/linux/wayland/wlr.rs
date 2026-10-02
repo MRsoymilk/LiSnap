@@ -4,20 +4,25 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     os::fd::AsFd,
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use lisnap_core::{CaptureError, CaptureFrame, CaptureRequest, PixelSize, RgbaImage, ScreenInfo};
-use rustix::fs::{MemfdFlags, memfd_create};
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    fs::{MemfdFlags, memfd_create},
+    time::Timespec,
+};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
-    protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool},
+    protocol::{wl_buffer, wl_callback, wl_display, wl_output, wl_registry, wl_shm, wl_shm_pool},
 };
 use wayland_protocols_wlr::screencopy::v1::client::{zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1};
 
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
 const WLR_SCREENCOPY_MANAGER_MAX_VERSION: u32 = 3;
 const WLR_SCREENCOPY_MANAGER: &str = "zwlr_screencopy_manager_v1";
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct OutputRecord {
@@ -54,6 +59,7 @@ struct CaptureState {
     buffer_done: bool,
     y_invert: bool,
     frame_state: Option<FrameState>,
+    sync_done: bool,
 }
 
 #[derive(Debug)]
@@ -71,12 +77,8 @@ pub(crate) fn capture_connection(
     let _registry = display.get_registry(&queue_handle, ());
     let mut state = CaptureState::default();
 
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|error| CaptureError::BackendFailure(format!("Wayland registry roundtrip failed: {error}")))?;
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|error| CaptureError::BackendFailure(format!("Wayland output roundtrip failed: {error}")))?;
+    bounded_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland registry initialization")?;
+    bounded_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland output initialization")?;
 
     let manager = state
         .manager
@@ -101,76 +103,81 @@ pub(crate) fn capture_connection(
             .ok_or_else(|| CaptureError::BackendFailure("selected Wayland output disappeared".into()))?;
         let output_proxy = output.proxy.clone();
         let frame = manager.capture_output(i32::from(request.include_cursor), &output_proxy, &queue_handle, ());
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        let capture_result = (|| -> Result<CaptureFrame, CaptureError> {
+            wait_for_buffer_offer(&mut event_queue, &mut state, deadline)?;
+            let spec = state
+                .buffer_spec
+                .ok_or_else(|| CaptureError::InvalidFrame("wlr-screencopy did not offer a SHM buffer".into()))?;
+            validate_spec(spec)?;
 
-        wait_for_buffer_offer(&mut event_queue, &mut state)?;
-        let spec = state
-            .buffer_spec
-            .ok_or_else(|| CaptureError::InvalidFrame("wlr-screencopy did not offer a SHM buffer".into()))?;
-        validate_spec(spec)?;
+            let byte_len = (spec.stride as usize)
+                .checked_mul(spec.height as usize)
+                .ok_or_else(|| CaptureError::InvalidFrame("wlr-screencopy SHM buffer size overflow".into()))?;
+            let size_i32 = i32::try_from(byte_len)
+                .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy SHM buffer exceeds protocol size".into()))?;
+            let width_i32 = i32::try_from(spec.width)
+                .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy width exceeds protocol range".into()))?;
+            let height_i32 = i32::try_from(spec.height)
+                .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy height exceeds protocol range".into()))?;
+            let stride_i32 = i32::try_from(spec.stride)
+                .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy stride exceeds protocol range".into()))?;
 
-        let byte_len = (spec.stride as usize)
-            .checked_mul(spec.height as usize)
-            .ok_or_else(|| CaptureError::InvalidFrame("wlr-screencopy SHM buffer size overflow".into()))?;
-        let size_i32 = i32::try_from(byte_len)
-            .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy SHM buffer exceeds protocol size".into()))?;
-        let width_i32 = i32::try_from(spec.width)
-            .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy width exceeds protocol range".into()))?;
-        let height_i32 = i32::try_from(spec.height)
-            .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy height exceeds protocol range".into()))?;
-        let stride_i32 = i32::try_from(spec.stride)
-            .map_err(|_| CaptureError::InvalidFrame("wlr-screencopy stride exceeds protocol range".into()))?;
+            let name = CString::new("lisnap-screencopy")
+                .map_err(|_| CaptureError::BackendFailure("invalid memfd name".into()))?;
+            let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+                .map_err(|error| CaptureError::BackendFailure(format!("memfd_create failed: {error}")))?;
+            let mut file = File::from(fd);
+            file.set_len(byte_len as u64)
+                .map_err(|error| CaptureError::BackendFailure(format!("resizing SHM buffer failed: {error}")))?;
 
-        let name =
-            CString::new("lisnap-screencopy").map_err(|_| CaptureError::BackendFailure("invalid memfd name".into()))?;
-        let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
-            .map_err(|error| CaptureError::BackendFailure(format!("memfd_create failed: {error}")))?;
-        let mut file = File::from(fd);
-        file.set_len(byte_len as u64)
-            .map_err(|error| CaptureError::BackendFailure(format!("resizing SHM buffer failed: {error}")))?;
+            let pool = shm.create_pool(file.as_fd(), size_i32, &queue_handle, ());
+            let buffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, spec.format, &queue_handle, ());
+            pool.destroy();
 
-        let pool = shm.create_pool(file.as_fd(), size_i32, &queue_handle, ());
-        let buffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, spec.format, &queue_handle, ());
-        pool.destroy();
+            let buffer_result = (|| -> Result<CaptureFrame, CaptureError> {
+                frame.copy(&buffer);
+                wait_for_frame(&mut event_queue, &mut state, deadline)?;
 
-        frame.copy(&buffer);
-        wait_for_frame(&mut event_queue, &mut state)?;
+                let mut native = vec![0_u8; byte_len];
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|error| CaptureError::BackendFailure(format!("seeking SHM buffer failed: {error}")))?;
+                file.read_exact(&mut native)
+                    .map_err(|error| CaptureError::BackendFailure(format!("reading SHM buffer failed: {error}")))?;
 
-        let mut native = vec![0_u8; byte_len];
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| CaptureError::BackendFailure(format!("seeking SHM buffer failed: {error}")))?;
-        file.read_exact(&mut native)
-            .map_err(|error| CaptureError::BackendFailure(format!("reading SHM buffer failed: {error}")))?;
-
-        buffer.destroy();
+                let pixels = convert_shm_rgba(spec, &native, state.y_invert)?;
+                let image = RgbaImage::new(PixelSize { width: spec.width, height: spec.height }, pixels)?;
+                let output = state
+                    .outputs
+                    .get(&output_id)
+                    .ok_or_else(|| CaptureError::BackendFailure("captured Wayland output disappeared".into()))?;
+                let stable_id = output.name.clone().unwrap_or_else(|| output_id.to_string());
+                let display_name = output
+                    .description
+                    .clone()
+                    .or_else(|| output.name.clone())
+                    .or_else(|| match (&output.make, &output.model) {
+                        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| stable_id.clone());
+                Ok(CaptureFrame {
+                    screen: ScreenInfo {
+                        id: stable_id,
+                        name: display_name,
+                        logical_geometry: None,
+                        pixel_size: PixelSize { width: spec.width, height: spec.height },
+                        scale_factor: output.scale_factor.map(f64::from),
+                    },
+                    image,
+                    captured_at: SystemTime::now(),
+                })
+            })();
+            buffer.destroy();
+            buffer_result
+        })();
         frame.destroy();
-
-        let pixels = convert_shm_rgba(spec, &native, state.y_invert)?;
-        let image = RgbaImage::new(PixelSize { width: spec.width, height: spec.height }, pixels)?;
-        let output = state
-            .outputs
-            .get(&output_id)
-            .ok_or_else(|| CaptureError::BackendFailure("captured Wayland output disappeared".into()))?;
-        let stable_id = output.name.clone().unwrap_or_else(|| output_id.to_string());
-        let display_name = output
-            .description
-            .clone()
-            .or_else(|| output.name.clone())
-            .or_else(|| match (&output.make, &output.model) {
-                (Some(make), Some(model)) => Some(format!("{make} {model}")),
-                _ => None,
-            })
-            .unwrap_or_else(|| stable_id.clone());
-        frames.push(CaptureFrame {
-            screen: ScreenInfo {
-                id: stable_id,
-                name: display_name,
-                logical_geometry: None,
-                pixel_size: PixelSize { width: spec.width, height: spec.height },
-                scale_factor: output.scale_factor.map(f64::from),
-            },
-            image,
-            captured_at: SystemTime::now(),
-        });
+        frames.push(capture_result?);
     }
 
     Ok(frames)
@@ -194,9 +201,26 @@ fn select_output_ids(state: &CaptureState, requested: Option<&str>) -> Result<Ve
     }
 }
 
+fn bounded_roundtrip(
+    display: &wl_display::WlDisplay,
+    queue_handle: &QueueHandle<CaptureState>,
+    event_queue: &mut wayland_client::EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    context: &str,
+) -> Result<(), CaptureError> {
+    state.sync_done = false;
+    let _callback = display.sync(queue_handle, ());
+    let deadline = Instant::now() + CAPTURE_TIMEOUT;
+    while !state.sync_done {
+        dispatch_with_deadline(event_queue, state, deadline, context)?;
+    }
+    Ok(())
+}
+
 fn wait_for_buffer_offer(
     event_queue: &mut wayland_client::EventQueue<CaptureState>,
     state: &mut CaptureState,
+    deadline: Instant,
 ) -> Result<(), CaptureError> {
     loop {
         if state.frame_state == Some(FrameState::Failed) {
@@ -206,15 +230,14 @@ fn wait_for_buffer_offer(
         if state.buffer_spec.is_some() && (manager_version < 3 || state.buffer_done) {
             return Ok(());
         }
-        event_queue
-            .blocking_dispatch(state)
-            .map_err(|error| CaptureError::BackendFailure(format!("wlr-screencopy negotiation failed: {error}")))?;
+        dispatch_with_deadline(event_queue, state, deadline, "wlr-screencopy negotiation")?;
     }
 }
 
 fn wait_for_frame(
     event_queue: &mut wayland_client::EventQueue<CaptureState>,
     state: &mut CaptureState,
+    deadline: Instant,
 ) -> Result<(), CaptureError> {
     loop {
         match state.frame_state {
@@ -222,12 +245,54 @@ fn wait_for_frame(
             Some(FrameState::Failed) => {
                 return Err(CaptureError::BackendFailure("wlr-screencopy compositor rejected the copy".into()));
             }
-            _ => {
-                event_queue
-                    .blocking_dispatch(state)
-                    .map_err(|error| CaptureError::BackendFailure(format!("wlr-screencopy copy failed: {error}")))?;
+            _ => dispatch_with_deadline(event_queue, state, deadline, "wlr-screencopy copy")?,
+        }
+    }
+}
+
+fn dispatch_with_deadline(
+    event_queue: &mut wayland_client::EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    deadline: Instant,
+    context: &str,
+) -> Result<(), CaptureError> {
+    loop {
+        let dispatched = event_queue
+            .dispatch_pending(state)
+            .map_err(|error| CaptureError::BackendFailure(format!("{context} dispatch failed: {error}")))?;
+        if dispatched > 0 {
+            return Ok(());
+        }
+
+        event_queue
+            .flush()
+            .map_err(|error| CaptureError::BackendFailure(format!("{context} flush failed: {error}")))?;
+        let Some(read_guard) = event_queue.prepare_read() else {
+            continue;
+        };
+        let remaining = deadline.checked_duration_since(Instant::now()).ok_or(CaptureError::Timeout)?;
+        let timeout = Timespec {
+            tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        let connection_fd = read_guard.connection_fd();
+        let mut poll_fds = [PollFd::from_borrowed_fd(connection_fd, PollFlags::IN | PollFlags::ERR | PollFlags::HUP)];
+        match poll(&mut poll_fds, Some(&timeout)) {
+            Ok(0) => {
+                drop(read_guard);
+                return Err(CaptureError::Timeout);
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => {
+                drop(read_guard);
+                continue;
+            }
+            Err(error) => {
+                drop(read_guard);
+                return Err(CaptureError::BackendFailure(format!("{context} poll failed: {error}")));
             }
         }
+        read_guard.read().map_err(|error| CaptureError::BackendFailure(format!("{context} read failed: {error}")))?;
     }
 }
 
@@ -278,6 +343,21 @@ fn convert_shm_rgba(spec: BufferSpec, native: &[u8], y_invert: bool) -> Result<V
 
 fn unpremultiply(channel: u8, alpha: u8) -> u8 {
     ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.sync_done = true;
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
