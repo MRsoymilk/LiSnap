@@ -6,12 +6,18 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle,
     protocol::{wl_output, wl_registry},
 };
+use wayland_protocols::ext::{
+    image_capture_source::v1::client::ext_output_image_capture_source_manager_v1,
+    image_copy_capture::v1::client::ext_image_copy_capture_manager_v1,
+};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
 
 use crate::{BackendKind, stub::StubBackend};
 
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
 const WLR_SCREENCOPY_MANAGER_MAX_VERSION: u32 = 3;
+const EXT_IMAGE_COPY_CAPTURE_MANAGER_MAX_VERSION: u32 = 1;
+const EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER_MAX_VERSION: u32 = 1;
 const EXT_IMAGE_COPY_CAPTURE_MANAGER: &str = "ext_image_copy_capture_manager_v1";
 const EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER: &str = "ext_output_image_capture_source_manager_v1";
 const WLR_SCREENCOPY_MANAGER: &str = "zwlr_screencopy_manager_v1";
@@ -48,20 +54,32 @@ pub struct WaylandProbe {
     pub ext_image_copy_capture_manager_version: Option<u32>,
     pub ext_output_image_capture_source_manager_version: Option<u32>,
     pub wlr_screencopy_manager_version: Option<u32>,
+    pub ext_image_copy_capture_manager_bound: bool,
+    pub ext_output_image_capture_source_manager_bound: bool,
     pub wlr_screencopy_manager_bound: bool,
 }
 
 impl WaylandProbe {
     pub fn preferred_capture_protocol(&self) -> Option<WaylandCaptureProtocol> {
-        if self.ext_image_copy_capture_manager_version.is_some()
-            && self.ext_output_image_capture_source_manager_version.is_some()
-        {
-            Some(WaylandCaptureProtocol::ExtImageCopyCapture)
-        } else if self.wlr_screencopy_manager_version.is_some() {
-            Some(WaylandCaptureProtocol::WlrScreencopy)
-        } else {
-            None
-        }
+        select_capture_protocol(
+            self.ext_image_copy_capture_manager_bound,
+            self.ext_output_image_capture_source_manager_bound,
+            self.wlr_screencopy_manager_bound,
+        )
+    }
+}
+
+fn select_capture_protocol(
+    ext_capture_bound: bool,
+    ext_source_bound: bool,
+    wlr_bound: bool,
+) -> Option<WaylandCaptureProtocol> {
+    if ext_capture_bound && ext_source_bound {
+        Some(WaylandCaptureProtocol::ExtImageCopyCapture)
+    } else if wlr_bound {
+        Some(WaylandCaptureProtocol::WlrScreencopy)
+    } else {
+        None
     }
 }
 
@@ -77,6 +95,9 @@ struct ProbeState {
     ext_image_copy_capture_manager_version: Option<u32>,
     ext_output_image_capture_source_manager_version: Option<u32>,
     wlr_screencopy_manager_version: Option<u32>,
+    ext_image_copy_capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
+    ext_output_image_capture_source_manager:
+        Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
     wlr_screencopy_manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
 }
 
@@ -97,6 +118,8 @@ impl ProbeState {
             ext_image_copy_capture_manager_version: self.ext_image_copy_capture_manager_version,
             ext_output_image_capture_source_manager_version: self.ext_output_image_capture_source_manager_version,
             wlr_screencopy_manager_version: self.wlr_screencopy_manager_version,
+            ext_image_copy_capture_manager_bound: self.ext_image_copy_capture_manager.is_some(),
+            ext_output_image_capture_source_manager_bound: self.ext_output_image_capture_source_manager.is_some(),
             wlr_screencopy_manager_bound: self.wlr_screencopy_manager.is_some(),
         }
     }
@@ -119,6 +142,25 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ProbeState {
         match event {
             wl_registry::Event::Global { name, interface, version } => {
                 state.record_global(&interface, version);
+                if interface == EXT_IMAGE_COPY_CAPTURE_MANAGER {
+                    let proxy = registry.bind::<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1, _, _>(
+                        name,
+                        version.min(EXT_IMAGE_COPY_CAPTURE_MANAGER_MAX_VERSION),
+                        queue_handle,
+                        (),
+                    );
+                    state.ext_image_copy_capture_manager = Some(proxy);
+                }
+                if interface == EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER {
+                    let proxy = registry
+                        .bind::<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1, _, _>(
+                        name,
+                        version.min(EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER_MAX_VERSION),
+                        queue_handle,
+                        (),
+                    );
+                    state.ext_output_image_capture_source_manager = Some(proxy);
+                }
                 if interface == WLR_SCREENCOPY_MANAGER {
                     let proxy = registry.bind::<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _, _>(
                         name,
@@ -158,6 +200,30 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ProbeState {
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _manager: &ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
+        _event: ext_image_copy_capture_manager_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _manager: &ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
+        _event: ext_output_image_capture_source_manager_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -244,24 +310,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefers_ext_capture_only_when_both_ext_globals_exist() {
-        let mut state = ProbeState::default();
-        state.record_global(EXT_IMAGE_COPY_CAPTURE_MANAGER, 1);
-        assert_eq!(state.finish().preferred_capture_protocol(), None);
-
-        let mut state = ProbeState::default();
-        state.record_global(EXT_IMAGE_COPY_CAPTURE_MANAGER, 1);
-        state.record_global(EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER, 1);
-        assert_eq!(state.finish().preferred_capture_protocol(), Some(WaylandCaptureProtocol::ExtImageCopyCapture));
+    fn prefers_ext_capture_only_when_both_ext_managers_are_bound() {
+        assert_eq!(select_capture_protocol(true, false, true), Some(WaylandCaptureProtocol::WlrScreencopy));
+        assert_eq!(select_capture_protocol(false, true, true), Some(WaylandCaptureProtocol::WlrScreencopy));
+        assert_eq!(select_capture_protocol(true, true, true), Some(WaylandCaptureProtocol::ExtImageCopyCapture));
     }
 
     #[test]
     fn falls_back_to_wlr_screencopy() {
-        let mut state = ProbeState::default();
-        state.record_global(WLR_SCREENCOPY_MANAGER, 3);
-        let probe = state.finish();
-        assert_eq!(probe.preferred_capture_protocol(), Some(WaylandCaptureProtocol::WlrScreencopy));
-        assert_eq!(probe.wlr_screencopy_manager_version, Some(3));
-        assert!(!probe.wlr_screencopy_manager_bound);
+        assert_eq!(select_capture_protocol(false, false, true), Some(WaylandCaptureProtocol::WlrScreencopy));
+        assert_eq!(select_capture_protocol(false, false, false), None);
     }
 }

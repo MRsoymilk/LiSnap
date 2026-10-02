@@ -84,6 +84,8 @@ fn print_wayland_probe(socket: Option<&str>) -> Result<(), String> {
         "ext-output-image-capture-source manager: {}",
         protocol_version(probe.ext_output_image_capture_source_manager_version)
     );
+    println!("ext-image-copy-capture manager bound: {}", probe.ext_image_copy_capture_manager_bound);
+    println!("ext-output-image-capture-source manager bound: {}", probe.ext_output_image_capture_source_manager_bound);
     println!("wlr-screencopy manager: {}", protocol_version(probe.wlr_screencopy_manager_version));
     println!("wlr-screencopy manager bound: {}", probe.wlr_screencopy_manager_bound);
     println!(

@@ -20,7 +20,7 @@
 ## S1：Hyprland / Wayland 单输出捕获
 
 - [ ] 连接 Wayland，枚举输出，探测真实协议能力与可用捕获源。（registry 探测与 `--probe-wayland` 已实现；EndlessVibe bubblewrap 未挂载宿主 Wayland socket，真机会话验收待在桌面环境执行。）
-- [ ] 按实际能力选择 ext-image-copy-capture 或 wlr-screencopy，无 Portal 回退。（已真实绑定 `zwlr_screencopy_manager_v1`；ext 协议对象绑定与真机选择验收待继续。）
+- [x] 按实际能力选择 ext-image-copy-capture 或 wlr-screencopy，无 Portal 回退。已真实绑定 ext capture/source 与 `zwlr_screencopy_manager_v1`，仅在两个 ext manager 均绑定成功时优先 ext，否则回退 wlr。
 - [ ] SHM 单帧捕获，处理格式、步长、旋转、权限拒绝和协议缺失。
 - [ ] 超时、取消、资源释放、非空结果与图像尺寸一致性验证。
 - [ ] 真机验证：获得当前输出的真实像素，不截入自身选择 UI。
