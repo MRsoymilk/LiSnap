@@ -4,8 +4,8 @@ use eframe::egui;
 use lisnap_core::{BackendDescriptor, CaptureCancellation, CaptureFrame, CaptureRequest, PixelSize, ScreenInfo};
 
 use crate::{
-    CaptureLauncher, CaptureReceiver, ScreenLauncher, ScreenReceiver,
-    selection::{normalized_selection, selection_pixels},
+    CaptureLauncher, CaptureReceiver, OverlayLauncher, OverlayReceiver, ScreenLauncher, ScreenReceiver,
+    selection::{normalized_selection, pixels_to_normalized_selection, selection_pixels},
 };
 
 struct ActiveCapture {
@@ -18,6 +18,8 @@ pub(crate) struct LiSnapApp {
     backends: Vec<BackendDescriptor>,
     request: CaptureRequest,
     capture_launcher: Option<CaptureLauncher>,
+    overlay_launcher: Option<OverlayLauncher>,
+    overlay_receiver: Option<OverlayReceiver>,
     screen_launcher: Option<ScreenLauncher>,
     screen_receiver: Option<ScreenReceiver>,
     screens: Vec<ScreenInfo>,
@@ -32,20 +34,24 @@ pub(crate) struct LiSnapApp {
     crop_texture: Option<egui::TextureHandle>,
     crop_size: Option<PixelSize>,
     capture_message: Option<String>,
+    overlay_message: Option<String>,
 }
 
 impl LiSnapApp {
-    pub(crate) fn new(
+    pub(crate) fn new_with_overlay(
         selected: Option<BackendDescriptor>,
         backends: Vec<BackendDescriptor>,
         capture_launcher: Option<CaptureLauncher>,
         screen_launcher: Option<ScreenLauncher>,
+        overlay_launcher: Option<OverlayLauncher>,
     ) -> Self {
         Self {
             selected,
             backends,
             request: CaptureRequest::default(),
             capture_launcher,
+            overlay_launcher,
+            overlay_receiver: None,
             screen_launcher,
             screen_receiver: None,
             screens: Vec::new(),
@@ -60,6 +66,7 @@ impl LiSnapApp {
             crop_texture: None,
             crop_size: None,
             capture_message: None,
+            overlay_message: None,
         }
     }
 
@@ -118,7 +125,7 @@ impl LiSnapApp {
     }
 
     fn start_capture(&mut self) {
-        if self.active_capture.is_some() {
+        if self.active_capture.is_some() || self.overlay_receiver.is_some() {
             return;
         }
         let Some(launcher) = self.capture_launcher.as_ref() else {
@@ -177,6 +184,67 @@ impl LiSnapApp {
             Err(TryRecvError::Disconnected) => {
                 self.active_capture = None;
                 self.capture_message = Some("Capture worker disconnected before returning a result.".into());
+            }
+            Err(TryRecvError::Empty) => {
+                context.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn start_overlay(&mut self) {
+        if self.overlay_receiver.is_some() || self.active_capture.is_some() {
+            return;
+        }
+        let Some(launcher) = self.overlay_launcher.clone() else {
+            self.overlay_message = Some("Wayland selection overlay is not available.".into());
+            return;
+        };
+        let Some(frame) = self.captured_frames.first().cloned() else {
+            self.overlay_message = Some("Capture a screen before opening the selection overlay.".into());
+            return;
+        };
+        self.clear_selection();
+        self.overlay_message = Some("Selection overlay active — drag to select, Esc to cancel.".into());
+        self.overlay_receiver = Some(launcher(frame));
+    }
+
+    fn poll_overlay(&mut self, context: &egui::Context) {
+        let Some(result) = self.overlay_receiver.as_ref().map(|receiver| receiver.try_recv()) else {
+            return;
+        };
+        match result {
+            Ok(Ok(Some(rect))) => {
+                self.overlay_receiver = None;
+                let Some(frame) = self.captured_frames.first() else {
+                    self.overlay_message = Some("Selection returned after the captured frame was cleared.".into());
+                    return;
+                };
+                let Some(selection) = pixels_to_normalized_selection(rect, frame.image.size()) else {
+                    self.overlay_message = Some("Overlay returned an invalid crop region.".into());
+                    return;
+                };
+                self.preview_selection = Some(selection);
+                match self.build_crop_preview(context) {
+                    Ok(()) => {
+                        self.overlay_message =
+                            Some(format!("Selected {}x{} px at {},{}.", rect.width, rect.height, rect.x, rect.y));
+                    }
+                    Err(error) => {
+                        self.overlay_message = Some(format!("Overlay crop failed: {error}"));
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                self.overlay_receiver = None;
+                self.overlay_message = Some("Selection overlay cancelled.".into());
+            }
+            Ok(Err(error)) => {
+                self.overlay_receiver = None;
+                self.overlay_message = Some(format!("Selection overlay failed: {error}"));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.overlay_receiver = None;
+                self.overlay_message = Some("Selection overlay worker disconnected.".into());
             }
             Err(TryRecvError::Empty) => {
                 context.request_repaint_after(Duration::from_millis(50));
@@ -263,7 +331,9 @@ impl LiSnapApp {
     }
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
-        let busy = self.active_capture.is_some();
+        let capture_busy = self.active_capture.is_some();
+        let overlay_busy = self.overlay_receiver.is_some();
+        let busy = capture_busy || overlay_busy;
         let screen_loading = self.screen_receiver.is_some();
 
         ui.horizontal(|ui| {
@@ -299,7 +369,7 @@ impl LiSnapApp {
             if ui.add_enabled(self.capture_launcher.is_some() && !busy, egui::Button::new("Capture screen")).clicked() {
                 self.start_capture();
             }
-            if ui.add_enabled(busy, egui::Button::new("Cancel")).clicked() {
+            if ui.add_enabled(capture_busy, egui::Button::new("Cancel capture")).clicked() {
                 self.cancel_capture();
             }
             ui.add_enabled(false, egui::Button::new("Copy"));
@@ -308,14 +378,30 @@ impl LiSnapApp {
         ui.add_enabled_ui(!busy, |ui| {
             ui.checkbox(&mut self.request.include_cursor, "Include cursor");
         });
-        ui.small("Capture runs on a worker thread. Selection overlay, clipboard and export are not active yet.");
+        ui.small(
+            "Capture and the Wayland selection overlay run on worker threads. Clipboard and export are not active yet.",
+        );
         if let Some(message) = &self.capture_message {
+            ui.label(message);
+        }
+        if let Some(message) = &self.overlay_message {
             ui.label(message);
         }
 
         if !self.captured_frames.is_empty() {
             ui.add_space(8.0);
-            ui.strong("Last capture");
+            ui.horizontal(|ui| {
+                ui.strong("Last capture");
+                if ui
+                    .add_enabled(self.overlay_launcher.is_some() && !busy, egui::Button::new("Select region"))
+                    .clicked()
+                {
+                    self.start_overlay();
+                }
+                if overlay_busy {
+                    ui.spinner();
+                }
+            });
             if let Some(texture) = &self.preview_texture {
                 if let Some(output) = &self.preview_output {
                     ui.small(format!("Preview: {output}"));
@@ -409,7 +495,10 @@ impl LiSnapApp {
 
 impl eframe::App for LiSnapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if ui.input(|input| input.key_pressed(egui::Key::Escape)) && self.active_capture.is_none() {
+        if ui.input(|input| input.key_pressed(egui::Key::Escape))
+            && self.active_capture.is_none()
+            && self.overlay_receiver.is_none()
+        {
             self.clear_selection();
         }
         if !self.screens_requested && self.screen_launcher.is_some() {
@@ -417,6 +506,7 @@ impl eframe::App for LiSnapApp {
         }
         self.poll_screens(ui.ctx());
         self.poll_capture(ui.ctx());
+        self.poll_overlay(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.overview(ui));
         });
@@ -430,14 +520,14 @@ mod tests {
         time::SystemTime,
     };
 
-    use lisnap_core::{PixelSize, RgbaImage, ScreenInfo};
+    use lisnap_core::{PixelRect, PixelSize, RgbaImage, ScreenInfo};
 
     use super::*;
 
     #[test]
     fn overview_renders_without_native_window() {
         let context = egui::Context::default();
-        let mut app = LiSnapApp::new(None, Vec::new(), None, None);
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), None, None, None);
 
         let mut output = context.run_ui(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| app.overview(ui));
@@ -462,7 +552,7 @@ mod tests {
                 .unwrap();
             receiver
         });
-        let mut app = LiSnapApp::new(None, Vec::new(), None, Some(launcher));
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), None, Some(launcher), None);
         app.request.screen_id = Some("missing-output".into());
         app.refresh_screens();
 
@@ -481,7 +571,7 @@ mod tests {
             sender.send(Err("synthetic failure".into())).unwrap();
             receiver
         });
-        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher), None);
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), Some(launcher), None, None);
         app.start_capture();
         assert!(app.active_capture.is_some());
 
@@ -510,7 +600,7 @@ mod tests {
             receiver
         });
         let context = egui::Context::default();
-        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher), None);
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), Some(launcher), None, None);
         app.start_capture();
 
         app.poll_capture(&context);
@@ -530,7 +620,7 @@ mod tests {
             let (_sender, receiver) = mpsc::channel();
             receiver
         });
-        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher), None);
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), Some(launcher), None, None);
         app.start_capture();
         let request = request_receiver.recv().unwrap();
         assert!(!request.is_cancelled());
@@ -563,7 +653,7 @@ mod tests {
             captured_at: SystemTime::now(),
         };
         let context = egui::Context::default();
-        let mut app = LiSnapApp::new(None, Vec::new(), None, None);
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), None, None, None);
         app.captured_frames = vec![frame];
         app.preview_selection = Some(egui::Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0)));
 
@@ -574,8 +664,79 @@ mod tests {
     }
 
     #[test]
+    fn overlay_worker_selection_builds_crop_preview() {
+        let image = RgbaImage::new(
+            PixelSize { width: 4, height: 2 },
+            vec![
+                1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255, 7, 0, 0, 255, 8, 0,
+                0, 255,
+            ],
+        )
+        .unwrap();
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display 1".into(),
+                logical_geometry: None,
+                pixel_size: image.size(),
+                scale_factor: Some(1.0),
+            },
+            image,
+            captured_at: SystemTime::now(),
+        };
+        let launcher: OverlayLauncher = Arc::new(|frame| {
+            assert_eq!(frame.screen.id, "DP-1");
+            let (sender, receiver) = mpsc::channel();
+            sender.send(Ok(Some(PixelRect { x: 1, y: 0, width: 2, height: 2 }))).unwrap();
+            receiver
+        });
+        let context = egui::Context::default();
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), None, None, Some(launcher));
+        app.captured_frames = vec![frame];
+
+        app.start_overlay();
+        assert!(app.overlay_receiver.is_some());
+        app.poll_overlay(&context);
+
+        assert!(app.overlay_receiver.is_none());
+        assert_eq!(app.crop_size, Some(PixelSize { width: 2, height: 2 }));
+        assert!(app.crop_texture.is_some());
+        assert_eq!(app.overlay_message.as_deref(), Some("Selected 2x2 px at 1,0."));
+        let pixels = selection_pixels(app.preview_selection.unwrap(), PixelSize { width: 4, height: 2 }).unwrap();
+        assert_eq!(pixels, PixelRect { x: 1, y: 0, width: 2, height: 2 });
+    }
+
+    #[test]
+    fn overlay_worker_cancel_returns_to_idle() {
+        let launcher: OverlayLauncher = Arc::new(|_frame| {
+            let (sender, receiver) = mpsc::channel();
+            sender.send(Ok(None)).unwrap();
+            receiver
+        });
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display 1".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 1, height: 1 },
+                scale_factor: Some(1.0),
+            },
+            image: RgbaImage::new(PixelSize { width: 1, height: 1 }, vec![0, 0, 0, 255]).unwrap(),
+            captured_at: SystemTime::now(),
+        };
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), None, None, Some(launcher));
+        app.captured_frames = vec![frame];
+
+        app.start_overlay();
+        app.poll_overlay(&egui::Context::default());
+
+        assert!(app.overlay_receiver.is_none());
+        assert_eq!(app.overlay_message.as_deref(), Some("Selection overlay cancelled."));
+    }
+
+    #[test]
     fn clear_selection_removes_crop_state() {
-        let mut app = LiSnapApp::new(None, Vec::new(), None, None);
+        let mut app = LiSnapApp::new_with_overlay(None, Vec::new(), None, None, None);
         app.selection_anchor = Some(egui::pos2(10.0, 20.0));
         app.preview_selection = Some(egui::Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.5, 0.6)));
         app.crop_size = Some(PixelSize { width: 100, height: 80 });

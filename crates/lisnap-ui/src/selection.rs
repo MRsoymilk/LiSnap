@@ -31,6 +31,24 @@ pub(crate) fn selection_pixels(selection: egui::Rect, size: PixelSize) -> Option
     )
 }
 
+pub(crate) fn pixels_to_normalized_selection(rect: PixelRect, size: PixelSize) -> Option<egui::Rect> {
+    let right = rect.x.checked_add(rect.width)?;
+    let bottom = rect.y.checked_add(rect.height)?;
+    if rect.width == 0
+        || rect.height == 0
+        || size.width == 0
+        || size.height == 0
+        || right > size.width
+        || bottom > size.height
+    {
+        return None;
+    }
+    Some(egui::Rect::from_min_max(
+        egui::pos2(rect.x as f32 / size.width as f32, rect.y as f32 / size.height as f32),
+        egui::pos2(right as f32 / size.width as f32, bottom as f32 / size.height as f32),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +68,18 @@ mod tests {
         let selection = egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75));
         let pixels = selection_pixels(selection, PixelSize { width: 1920, height: 1080 }).unwrap();
         assert_eq!(pixels, PixelRect { x: 480, y: 270, width: 960, height: 540 });
+    }
+
+    #[test]
+    fn maps_pixel_selection_back_to_normalized_coordinates() {
+        let normalized = pixels_to_normalized_selection(
+            PixelRect { x: 480, y: 270, width: 960, height: 540 },
+            PixelSize { width: 1920, height: 1080 },
+        )
+        .unwrap();
+        assert!((normalized.min.x - 0.25).abs() < f32::EPSILON);
+        assert!((normalized.min.y - 0.25).abs() < f32::EPSILON);
+        assert!((normalized.max.x - 0.75).abs() < f32::EPSILON);
+        assert!((normalized.max.y - 0.75).abs() < f32::EPSILON);
     }
 }
