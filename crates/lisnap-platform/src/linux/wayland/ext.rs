@@ -43,6 +43,17 @@ pub(crate) struct ExtCaptureConstraints {
 struct OutputRecord {
     proxy: wl_output::WlOutput,
     name: Option<String>,
+    description: Option<String>,
+    make: Option<String>,
+    model: Option<String>,
+    scale_factor: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureOutputInfo {
+    id: String,
+    name: String,
+    scale_factor: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -216,7 +227,18 @@ pub(crate) fn capture_connection(
             .get(&output_id)
             .ok_or_else(|| CaptureError::BackendFailure("selected Wayland output disappeared".into()))?;
         let output_proxy = output.proxy.clone();
-        let output_name = output.name.clone().unwrap_or_else(|| output_id.to_string());
+        let stable_id = output.name.clone().unwrap_or_else(|| output_id.to_string());
+        let display_name = output
+            .description
+            .clone()
+            .or_else(|| output.name.clone())
+            .or_else(|| match (&output.make, &output.model) {
+                (Some(make), Some(model)) => Some(format!("{make} {model}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| stable_id.clone());
+        let output_info =
+            CaptureOutputInfo { id: stable_id, name: display_name, scale_factor: output.scale_factor.map(f64::from) };
 
         let source = source_manager.create_source(&output_proxy, &queue_handle, ());
         let options = if request.include_cursor {
@@ -236,7 +258,7 @@ pub(crate) fn capture_connection(
                     &mut event_queue,
                     &mut state,
                     request,
-                    &output_name,
+                    &output_info,
                 )? {
                     Some(frame) => return Ok(frame),
                     None if attempt == 0 => {
@@ -268,7 +290,7 @@ fn capture_frame_attempt(
     event_queue: &mut wayland_client::EventQueue<ExtState>,
     state: &mut ExtState,
     request: &CaptureRequest,
-    output_name: &str,
+    output: &CaptureOutputInfo,
 ) -> Result<Option<CaptureFrame>, CaptureError> {
     let size = state
         .constraint_size
@@ -353,11 +375,11 @@ fn capture_frame_attempt(
         let image = RgbaImage::new(pixel_size, rgba)?;
         Ok(Some(CaptureFrame {
             screen: ScreenInfo {
-                id: output_name.to_owned(),
-                name: output_name.to_owned(),
+                id: output.id.clone(),
+                name: output.name.clone(),
                 logical_geometry: None,
                 pixel_size,
-                scale_factor: None,
+                scale_factor: output.scale_factor,
             },
             image,
             captured_at: SystemTime::now(),
@@ -638,7 +660,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ExtState {
                     queue_handle,
                     OutputData { global_name: name },
                 );
-                state.outputs.insert(name, OutputRecord { proxy, name: None });
+                state.outputs.insert(
+                    name,
+                    OutputRecord { proxy, name: None, description: None, make: None, model: None, scale_factor: None },
+                );
             }
             wl_registry::Event::GlobalRemove { name } => {
                 state.outputs.remove(&name);
@@ -657,10 +682,18 @@ impl Dispatch<wl_output::WlOutput, OutputData> for ExtState {
         _connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event
-            && let Some(output) = state.outputs.get_mut(&data.global_name)
-        {
-            output.name = Some(name);
+        let Some(output) = state.outputs.get_mut(&data.global_name) else {
+            return;
+        };
+        match event {
+            wl_output::Event::Geometry { make, model, .. } => {
+                output.make = Some(make);
+                output.model = Some(model);
+            }
+            wl_output::Event::Scale { factor } => output.scale_factor = Some(factor),
+            wl_output::Event::Name { name } => output.name = Some(name),
+            wl_output::Event::Description { description } => output.description = Some(description),
+            _ => {}
         }
     }
 }
