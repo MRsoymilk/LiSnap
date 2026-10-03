@@ -3,14 +3,23 @@ mod ext;
 mod shm;
 mod wlr;
 
-use std::{collections::BTreeMap, os::unix::net::UnixStream, path::Path};
+use std::{
+    collections::BTreeMap,
+    os::unix::net::UnixStream,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use lisnap_core::{
     BackendDescriptor, BackendStatus, CaptureBackend, CaptureError, CaptureFrame, CaptureRequest, PixelSize, ScreenInfo,
 };
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    time::Timespec,
+};
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
-    protocol::{wl_output, wl_registry},
+    protocol::{wl_callback, wl_display, wl_output, wl_registry},
 };
 use wayland_protocols::ext::{
     image_capture_source::v1::client::ext_output_image_capture_source_manager_v1,
@@ -19,6 +28,7 @@ use wayland_protocols::ext::{
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
 
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const WLR_SCREENCOPY_MANAGER_MAX_VERSION: u32 = 3;
 const EXT_IMAGE_COPY_CAPTURE_MANAGER_MAX_VERSION: u32 = 1;
 const EXT_OUTPUT_IMAGE_CAPTURE_SOURCE_MANAGER_MAX_VERSION: u32 = 1;
@@ -113,6 +123,7 @@ struct ProbeState {
     ext_output_image_capture_source_manager:
         Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
     wlr_screencopy_manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
+    sync_done: bool,
 }
 
 impl ProbeState {
@@ -253,6 +264,21 @@ impl Dispatch<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, ()> for Probe
         _connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for ProbeState {
+    fn event(
+        state: &mut Self,
+        _callback: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.sync_done = true;
+        }
     }
 }
 
@@ -422,14 +448,72 @@ fn probe_connection(connection: Connection) -> Result<WaylandProbe, CaptureError
     let _registry = display.get_registry(&queue_handle, ());
     let mut state = ProbeState::default();
 
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|error| CaptureError::BackendFailure(format!("Wayland registry roundtrip failed: {error}")))?;
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|error| CaptureError::BackendFailure(format!("Wayland output roundtrip failed: {error}")))?;
+    bounded_probe_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland registry probe")?;
+    bounded_probe_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland output probe")?;
 
     Ok(state.finish())
+}
+
+fn bounded_probe_roundtrip(
+    display: &wl_display::WlDisplay,
+    queue_handle: &QueueHandle<ProbeState>,
+    event_queue: &mut wayland_client::EventQueue<ProbeState>,
+    state: &mut ProbeState,
+    context: &str,
+) -> Result<(), CaptureError> {
+    state.sync_done = false;
+    let _callback = display.sync(queue_handle, ());
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    while !state.sync_done {
+        dispatch_probe_with_deadline(event_queue, state, deadline, context)?;
+    }
+    Ok(())
+}
+
+fn dispatch_probe_with_deadline(
+    event_queue: &mut wayland_client::EventQueue<ProbeState>,
+    state: &mut ProbeState,
+    deadline: Instant,
+    context: &str,
+) -> Result<(), CaptureError> {
+    loop {
+        let dispatched = event_queue
+            .dispatch_pending(state)
+            .map_err(|error| CaptureError::BackendFailure(format!("{context} dispatch failed: {error}")))?;
+        if dispatched > 0 {
+            return Ok(());
+        }
+
+        event_queue
+            .flush()
+            .map_err(|error| CaptureError::BackendFailure(format!("{context} flush failed: {error}")))?;
+        let Some(read_guard) = event_queue.prepare_read() else {
+            continue;
+        };
+        let remaining = deadline.checked_duration_since(Instant::now()).ok_or(CaptureError::Timeout)?;
+        let timeout = Timespec {
+            tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        let connection_fd = read_guard.connection_fd();
+        let mut poll_fds = [PollFd::from_borrowed_fd(connection_fd, PollFlags::IN | PollFlags::ERR | PollFlags::HUP)];
+        match poll(&mut poll_fds, Some(&timeout)) {
+            Ok(0) => {
+                drop(read_guard);
+                return Err(CaptureError::Timeout);
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => {
+                drop(read_guard);
+                continue;
+            }
+            Err(error) => {
+                drop(read_guard);
+                return Err(CaptureError::BackendFailure(format!("{context} poll failed: {error}")));
+            }
+        }
+        read_guard.read().map_err(|error| CaptureError::BackendFailure(format!("{context} read failed: {error}")))?;
+    }
 }
 
 fn normalized_pixel_size(size: Option<PixelSize>, transform: wl_output::Transform) -> Option<PixelSize> {
