@@ -6,7 +6,7 @@
 
 `lisnap-core` 定义图像、显示器、截图请求、错误、后端 trait 和选区算法；不依赖 egui、窗口系统、异步运行时或操作系统接口。
 
-`lisnap-platform` 实现后端工厂。Linux、Windows、macOS 模块通过 `cfg(target_os)` 隔离，后续原生依赖只能加入相应的 target-specific Cargo 依赖表。当前每个后端都使用 `StubBackend`，屏幕枚举与捕获必须返回 `NotImplemented`。
+`lisnap-platform` 实现后端工厂。Linux、Windows、macOS 模块通过 `cfg(target_os)` 隔离，原生依赖只加入相应的 target-specific Cargo 依赖表。Linux/Wayland 已实现真实输出枚举与 SHM 单帧捕获，优先 `ext-image-copy-capture`、回退 `wlr-screencopy`；X11、Windows、macOS 当前仍使用 `StubBackend` 并明确返回 `NotImplemented`。
 
 `lisnap-ui` 使用 egui/eframe + wgpu 绘制普通桌面窗口；它不是截图后端，也不是已经实现的全屏选择覆盖层。此层不决定截图协议。
 
@@ -31,17 +31,17 @@ apps/lisnap ──→ lisnap-platform ──→ lisnap-core
 
 先完成所有目标输出的捕获，再显示选区覆盖层，避免把自身 UI 截进去。接着在静态图像上交互，确认后从原始像素裁剪，再合成用户主动添加的标注。关闭/取消时释放连接、帧和覆盖层资源。
 
-实际捕获不得阻塞 UI 重绘回调。原生 API 的线程约束由对应后端或服务层负责；当前 trait 不强制 `Send`，不提前假定 macOS、Wayland 与 Windows 的线程模型相同。工作队列、取消、超时调度、忙碌状态尚未实现。
+实际捕获不得阻塞 UI 重绘回调。原生 API 的线程约束由对应后端或服务层负责；当前 trait 不强制 `Send`，不提前假定 macOS、Wayland 与 Windows 的线程模型相同。Wayland 后端已实现 5 秒 deadline 与 `CaptureCancellation` 协作取消；桌面壳层尚未接入后台捕获 worker、忙碌状态和结果预览。
 
 ## 原生后端开发顺序
 
-首先面向 Hyprland，探测 Wayland registry 中实际公布的协议。计划优先使用 `ext-image-copy-capture` 与相应的捕获源协议，兼容存在的 `wlr-screencopy`；没有对应能力就明确返回不支持，不暗中回退到 Portal 或 XWayland。
+首先面向 Hyprland，探测 Wayland registry 中实际公布的协议。当前实现优先使用 `ext-image-copy-capture` 与相应捕获源协议，兼容 `wlr-screencopy`；没有对应能力就明确返回不支持，不暗中回退到 Portal 或 XWayland。
 
-先用 SHM 完成真实单输出截图，再处理 DMA-BUF 优化。系统或合成器的授权要求必须正常处理；本项目不通过 root、CAP_SYS_ADMIN 或 DRM master 抢占作为常规截图路径。
+SHM 单帧捕获已完成：两条路径均支持 ARGB/XRGB、stride、输出方向归一化、光标选项、超时与取消；ext 还会处理动态 buffer constraints 并重试一次。DMA-BUF、HDR/色彩管理仍属于后续优化。系统或合成器的授权要求必须正常处理；本项目不通过 root、CAP_SYS_ADMIN 或 DRM master 抢占作为常规截图路径。
 
 无 Portal 的 Wayland 路径只面向提供所需能力的合成器，不承诺覆盖所有 Wayland 桌面。覆盖层也要单独进行平台适配；Hyprland 的 layer-shell 路径应与普通 egui 窗口分离，不能认为普通全屏窗口天然具备所有置顶、定位和输入行为。
 
-随后接入 X11 SHM/GetImage、Windows Graphics Capture、macOS ScreenCaptureKit。以上是开发目标，不是已经实现的能力。
+下一阶段在真实 Wayland 会话完成像素验收后实现静态覆盖层与选区；随后再接入 X11 SHM/GetImage、Windows Graphics Capture、macOS ScreenCaptureKit。后三者仍是开发目标，不是已经实现的能力。
 
 ## 验证边界
 

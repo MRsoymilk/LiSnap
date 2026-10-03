@@ -19,9 +19,9 @@ impl LiSnapApp {
         });
         ui.label("Cross-platform screenshot tool");
         ui.separator();
-        ui.heading("Project framework");
-        ui.label("This is the desktop shell. Native screen capture is not implemented yet.");
-        ui.label("No desktop image has been captured. No Portal request is made.");
+        ui.heading("Project status");
+        ui.label("Linux/Wayland native capture is implemented in the backend and headless CLI.");
+        ui.label("This desktop shell has not wired its capture worker yet. No Portal request is made.");
         ui.add_space(12.0);
         ui.group(|ui| {
             ui.strong("Selected backend");
@@ -40,13 +40,13 @@ impl LiSnapApp {
             ui.add_enabled(false, egui::Button::new("Save"));
         });
         ui.checkbox(&mut self.request.include_cursor, "Include cursor (setting preview)");
-        ui.small("Capture, selection overlay, clipboard and export are planned, not active controls.");
+        ui.small("Selection overlay, clipboard and export are planned; capture is currently available through the CLI.");
         ui.add_space(12.0);
         ui.heading("Native backend roadmap");
         egui::Grid::new("backend_inventory").num_columns(3).striped(true).spacing([20.0, 8.0]).show(ui, |ui| {
             ui.strong("Backend");
             ui.strong("Status");
-            ui.strong("Planned API");
+            ui.strong("Native API");
             ui.end_row();
             for backend in &self.backends {
                 ui.label(backend.name);
@@ -57,7 +57,7 @@ impl LiSnapApp {
         });
         ui.add_space(12.0);
         ui.separator();
-        ui.small("Next: native Wayland capability discovery and single-output frame capture.");
+        ui.small("Next: complete host Wayland pixel validation, then wire background capture and the selection overlay.");
     }
 }
 
