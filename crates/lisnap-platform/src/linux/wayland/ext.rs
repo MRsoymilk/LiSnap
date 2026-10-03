@@ -57,7 +57,7 @@ struct ExtState {
     session_stopped: bool,
     shm: Option<wl_shm::WlShm>,
     frame_state: Option<FrameState>,
-    frame_transform: Option<wl_output::Transform>,
+    frame_transform: Option<FrameTransform>,
     sync_done: bool,
 }
 
@@ -78,6 +78,12 @@ enum FrameState {
     Waiting,
     Ready,
     Failed(FrameFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameTransform {
+    Known(wl_output::Transform),
+    Unknown,
 }
 
 pub(crate) fn negotiate_connection(
@@ -330,7 +336,19 @@ fn capture_frame_attempt(
             .map_err(|error| CaptureError::BackendFailure(format!("reading ext SHM buffer failed: {error}")))?;
 
         let rgba = convert_shm_rgba(format, size, stride, &native)?;
-        let transform = state.frame_transform.unwrap_or(wl_output::Transform::Normal);
+        let transform = match state.frame_transform {
+            Some(FrameTransform::Known(transform)) => transform,
+            Some(FrameTransform::Unknown) => {
+                return Err(CaptureError::Unsupported(
+                    "ext-image-copy-capture returned an unknown Wayland transform".into(),
+                ));
+            }
+            None => {
+                return Err(CaptureError::InvalidFrame(
+                    "ext-image-copy-capture ready frame omitted transform metadata".into(),
+                ));
+            }
+        };
         let (pixel_size, rgba) = normalize_transform(size, rgba, transform)?;
         let image = RgbaImage::new(pixel_size, rgba)?;
         Ok(Some(CaptureFrame {
@@ -744,8 +762,11 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
         _queue_handle: &QueueHandle<Self>,
     ) {
         match event {
-            ext_image_copy_capture_frame_v1::Event::Transform { transform: WEnum::Value(transform) } => {
-                state.frame_transform = Some(transform)
+            ext_image_copy_capture_frame_v1::Event::Transform { transform } => {
+                state.frame_transform = Some(match transform {
+                    WEnum::Value(transform) => FrameTransform::Known(transform),
+                    _ => FrameTransform::Unknown,
+                });
             }
             ext_image_copy_capture_frame_v1::Event::Ready => {
                 state.frame_state = Some(FrameState::Ready);
