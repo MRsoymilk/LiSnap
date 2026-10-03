@@ -391,21 +391,15 @@ fn normalize_transform(
     let mut dst = vec![0_u8; rgba.len()];
     for y in 0..size.height {
         for x in 0..size.width {
-            let flipped = matches!(
-                transform,
-                wl_output::Transform::Flipped
-                    | wl_output::Transform::Flipped90
-                    | wl_output::Transform::Flipped180
-                    | wl_output::Transform::Flipped270
-            );
-            let fx = if flipped { size.width - 1 - x } else { x };
             let (dx, dy) = match transform {
-                wl_output::Transform::Normal | wl_output::Transform::Flipped => (fx, y),
-                wl_output::Transform::_90 | wl_output::Transform::Flipped90 => (size.height - 1 - y, fx),
-                wl_output::Transform::_180 | wl_output::Transform::Flipped180 => {
-                    (size.width - 1 - fx, size.height - 1 - y)
-                }
-                wl_output::Transform::_270 | wl_output::Transform::Flipped270 => (y, size.width - 1 - fx),
+                wl_output::Transform::Normal => (x, y),
+                wl_output::Transform::_90 => (y, size.width - 1 - x),
+                wl_output::Transform::_180 => (size.width - 1 - x, size.height - 1 - y),
+                wl_output::Transform::_270 => (size.height - 1 - y, x),
+                wl_output::Transform::Flipped => (size.width - 1 - x, y),
+                wl_output::Transform::Flipped90 => (y, x),
+                wl_output::Transform::Flipped180 => (x, size.height - 1 - y),
+                wl_output::Transform::Flipped270 => (size.height - 1 - y, size.width - 1 - x),
                 _ => {
                     return Err(CaptureError::Unsupported(format!("unknown Wayland output transform {transform:?}")));
                 }
@@ -751,13 +745,33 @@ mod tests {
         assert_eq!(rgba, vec![1, 2, 3, 255, 10, 20, 30, 255]);
     }
 
+    fn labeled_rgba(values: &[u8]) -> Vec<u8> {
+        values.iter().flat_map(|value| [*value, 0, 0, 255]).collect()
+    }
+
+    fn red_channel(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
     #[test]
-    fn rotates_rgba_90_degrees() {
-        let size = PixelSize { width: 2, height: 1 };
-        let rgba = vec![1, 0, 0, 255, 2, 0, 0, 255];
-        let (size, rotated) = normalize_transform(size, rgba, wl_output::Transform::_90).unwrap();
-        assert_eq!(size, PixelSize { width: 1, height: 2 });
-        assert_eq!(rotated, vec![1, 0, 0, 255, 2, 0, 0, 255]);
+    fn normalizes_all_wayland_transforms() {
+        let size = PixelSize { width: 2, height: 3 };
+        let source = labeled_rgba(&[1, 2, 3, 4, 5, 6]);
+        let cases = [
+            (wl_output::Transform::Normal, PixelSize { width: 2, height: 3 }, vec![1, 2, 3, 4, 5, 6]),
+            (wl_output::Transform::_90, PixelSize { width: 3, height: 2 }, vec![2, 4, 6, 1, 3, 5]),
+            (wl_output::Transform::_180, PixelSize { width: 2, height: 3 }, vec![6, 5, 4, 3, 2, 1]),
+            (wl_output::Transform::_270, PixelSize { width: 3, height: 2 }, vec![5, 3, 1, 6, 4, 2]),
+            (wl_output::Transform::Flipped, PixelSize { width: 2, height: 3 }, vec![2, 1, 4, 3, 6, 5]),
+            (wl_output::Transform::Flipped90, PixelSize { width: 3, height: 2 }, vec![1, 3, 5, 2, 4, 6]),
+            (wl_output::Transform::Flipped180, PixelSize { width: 2, height: 3 }, vec![5, 6, 3, 4, 1, 2]),
+            (wl_output::Transform::Flipped270, PixelSize { width: 3, height: 2 }, vec![6, 4, 2, 5, 3, 1]),
+        ];
+        for (transform, expected_size, expected_red) in cases {
+            let (actual_size, transformed) = normalize_transform(size, source.clone(), transform).unwrap();
+            assert_eq!(actual_size, expected_size, "{transform:?}");
+            assert_eq!(red_channel(&transformed), expected_red, "{transform:?}");
+        }
     }
 
     #[test]
