@@ -29,12 +29,18 @@ impl BackendKind {
 
     pub fn descriptor(self) -> BackendDescriptor {
         let (id, name, technology, supported) = match self {
-            Self::Wayland => (
-                "wayland",
-                "Wayland native",
-                "ext-image-copy-capture / wlr-screencopy (planned)",
-                cfg!(target_os = "linux"),
-            ),
+            Self::Wayland => {
+                return BackendDescriptor {
+                    id: "wayland",
+                    name: "Wayland native",
+                    technology: "wlr-screencopy SHM; ext-image-copy-capture negotiation",
+                    status: if cfg!(target_os = "linux") {
+                        BackendStatus::Available
+                    } else {
+                        BackendStatus::Unsupported
+                    },
+                };
+            }
             Self::X11 => ("x11", "X11 native", "X11 SHM / GetImage (planned)", cfg!(target_os = "linux")),
             Self::Windows => {
                 ("windows", "Windows native", "Windows Graphics Capture (planned)", cfg!(target_os = "windows"))

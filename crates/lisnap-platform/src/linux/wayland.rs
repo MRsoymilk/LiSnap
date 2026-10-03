@@ -3,9 +3,11 @@ mod wlr;
 
 use std::{collections::BTreeMap, os::unix::net::UnixStream, path::Path};
 
-use lisnap_core::{CaptureBackend, CaptureError, CaptureFrame, CaptureRequest};
+use lisnap_core::{
+    BackendDescriptor, BackendStatus, CaptureBackend, CaptureError, CaptureFrame, CaptureRequest, PixelSize, ScreenInfo,
+};
 use wayland_client::{
-    Connection, Dispatch, QueueHandle,
+    Connection, Dispatch, QueueHandle, WEnum,
     protocol::{wl_output, wl_registry},
 };
 use wayland_protocols::ext::{
@@ -13,8 +15,6 @@ use wayland_protocols::ext::{
     image_copy_capture::v1::client::ext_image_copy_capture_manager_v1,
 };
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
-
-use crate::{BackendKind, stub::StubBackend};
 
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
 const WLR_SCREENCOPY_MANAGER_MAX_VERSION: u32 = 3;
@@ -48,6 +48,7 @@ pub struct WaylandOutput {
     pub make: Option<String>,
     pub model: Option<String>,
     pub scale_factor: Option<i32>,
+    pub pixel_size: Option<PixelSize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,8 @@ fn select_capture_protocol(
 struct OutputRecord {
     _proxy: wl_output::WlOutput,
     info: WaylandOutput,
+    transform: wl_output::Transform,
+    mode_size: Option<PixelSize>,
 }
 
 #[derive(Debug, Default)]
@@ -192,7 +195,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ProbeState {
                                 make: None,
                                 model: None,
                                 scale_factor: None,
+                                pixel_size: None,
                             },
+                            transform: wl_output::Transform::Normal,
+                            mode_size: None,
                         },
                     );
                 }
@@ -254,9 +260,22 @@ impl Dispatch<wl_output::WlOutput, OutputData> for ProbeState {
             return;
         };
         match event {
-            wl_output::Event::Geometry { make, model, .. } => {
+            wl_output::Event::Geometry { make, model, transform, .. } => {
                 record.info.make = Some(make);
                 record.info.model = Some(model);
+                if let WEnum::Value(transform) = transform {
+                    record.transform = transform;
+                    record.info.pixel_size = normalized_pixel_size(record.mode_size, record.transform);
+                }
+            }
+            wl_output::Event::Mode { flags, width, height, .. } => {
+                if matches!(flags, WEnum::Value(flags) if flags.contains(wl_output::Mode::Current))
+                    && width > 0
+                    && height > 0
+                {
+                    record.mode_size = Some(PixelSize { width: width as u32, height: height as u32 });
+                    record.info.pixel_size = normalized_pixel_size(record.mode_size, record.transform);
+                }
             }
             wl_output::Event::Scale { factor } => {
                 record.info.scale_factor = Some(factor);
@@ -317,8 +336,72 @@ fn probe_connection(connection: Connection) -> Result<WaylandProbe, CaptureError
     Ok(state.finish())
 }
 
+fn normalized_pixel_size(size: Option<PixelSize>, transform: wl_output::Transform) -> Option<PixelSize> {
+    let size = size?;
+    if matches!(
+        transform,
+        wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270
+    ) {
+        Some(PixelSize { width: size.height, height: size.width })
+    } else {
+        Some(size)
+    }
+}
+
+struct WaylandBackend;
+
+impl CaptureBackend for WaylandBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            id: "wayland",
+            name: "Wayland native",
+            technology: "wlr-screencopy SHM; ext-image-copy-capture negotiation",
+            status: BackendStatus::Available,
+        }
+    }
+
+    fn screens(&mut self) -> Result<Vec<ScreenInfo>, CaptureError> {
+        let probe = probe()?;
+        let screens = probe
+            .outputs
+            .into_iter()
+            .filter_map(|output| {
+                let pixel_size = output.pixel_size?;
+                let id = output.name.clone().unwrap_or_else(|| output.global_name.to_string());
+                let name = output
+                    .description
+                    .or(output.name)
+                    .or_else(|| match (output.make, output.model) {
+                        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| id.clone());
+                Some(ScreenInfo {
+                    id,
+                    name,
+                    logical_geometry: None,
+                    pixel_size,
+                    scale_factor: output.scale_factor.map(f64::from),
+                })
+            })
+            .collect::<Vec<_>>();
+        if screens.is_empty() {
+            Err(CaptureError::InvalidFrame("Wayland compositor exposed no output with a current pixel mode".into()))
+        } else {
+            Ok(screens)
+        }
+    }
+
+    fn capture(&mut self, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+        capture_wlr(request)
+    }
+}
+
 pub(crate) fn create() -> Box<dyn CaptureBackend> {
-    Box::new(StubBackend(BackendKind::Wayland))
+    Box::new(WaylandBackend)
 }
 
 #[cfg(test)]
@@ -336,5 +419,24 @@ mod tests {
     fn falls_back_to_wlr_screencopy() {
         assert_eq!(select_capture_protocol(false, false, true), Some(WaylandCaptureProtocol::WlrScreencopy));
         assert_eq!(select_capture_protocol(false, false, false), None);
+    }
+
+    #[test]
+    fn normalizes_rotated_output_pixel_size() {
+        let size = PixelSize { width: 1920, height: 1080 };
+        assert_eq!(normalized_pixel_size(Some(size), wl_output::Transform::Normal), Some(size));
+        assert_eq!(
+            normalized_pixel_size(Some(size), wl_output::Transform::_90),
+            Some(PixelSize { width: 1080, height: 1920 })
+        );
+        assert_eq!(
+            normalized_pixel_size(Some(size), wl_output::Transform::Flipped270),
+            Some(PixelSize { width: 1080, height: 1920 })
+        );
+    }
+
+    #[test]
+    fn wayland_backend_reports_available_implementation() {
+        assert_eq!(create().descriptor().status, BackendStatus::Available);
     }
 }
