@@ -336,6 +336,44 @@ fn map_ext_constraints(
         .collect())
 }
 
+pub fn capture_auto(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+    let probe = probe()?;
+    capture_with_probe(request, &probe, None)
+}
+
+pub fn capture_auto_socket(path: &Path, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+    let probe = probe_socket(path)?;
+    capture_with_probe(request, &probe, Some(path))
+}
+
+fn capture_with_probe(
+    request: &CaptureRequest,
+    probe: &WaylandProbe,
+    socket: Option<&Path>,
+) -> Result<Vec<CaptureFrame>, CaptureError> {
+    let ext_capture = || match socket {
+        Some(path) => capture_ext_socket(path, request),
+        None => capture_ext(request),
+    };
+    let wlr_capture = || match socket {
+        Some(path) => capture_wlr_socket(path, request),
+        None => capture_wlr(request),
+    };
+    match probe.preferred_capture_protocol() {
+        Some(WaylandCaptureProtocol::ExtImageCopyCapture) => match ext_capture() {
+            Ok(frames) => Ok(frames),
+            Err(CaptureError::Unsupported(_) | CaptureError::InvalidFrame(_)) if probe.wlr_screencopy_manager_bound => {
+                wlr_capture()
+            }
+            Err(error) => Err(error),
+        },
+        Some(WaylandCaptureProtocol::WlrScreencopy) => wlr_capture(),
+        None => Err(CaptureError::Unsupported(
+            "Wayland compositor advertises neither ext-image-copy-capture nor wlr-screencopy".into(),
+        )),
+    }
+}
+
 pub fn capture_ext(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
     let connection = Connection::connect_to_env()
         .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
@@ -357,8 +395,13 @@ pub fn capture_wlr_socket(path: &Path, request: &CaptureRequest) -> Result<Vec<C
 }
 
 fn connect_socket(path: &Path) -> Result<Connection, CaptureError> {
-    let socket = UnixStream::connect(path)
-        .map_err(|error| CaptureError::BackendFailure(format!("Wayland socket {} failed: {error}", path.display())))?;
+    let socket = UnixStream::connect(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            CaptureError::PermissionDenied(format!("Wayland socket {}: {error}", path.display()))
+        } else {
+            CaptureError::BackendFailure(format!("Wayland socket {} failed: {error}", path.display()))
+        }
+    })?;
     Connection::from_socket(socket)
         .map_err(|error| CaptureError::BackendFailure(format!("Wayland socket handshake failed: {error}")))
 }
@@ -440,22 +483,7 @@ impl CaptureBackend for WaylandBackend {
     }
 
     fn capture(&mut self, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
-        let probe = probe()?;
-        match probe.preferred_capture_protocol() {
-            Some(WaylandCaptureProtocol::ExtImageCopyCapture) => match capture_ext(request) {
-                Ok(frames) => Ok(frames),
-                Err(CaptureError::Unsupported(_) | CaptureError::InvalidFrame(_))
-                    if probe.wlr_screencopy_manager_bound =>
-                {
-                    capture_wlr(request)
-                }
-                Err(error) => Err(error),
-            },
-            Some(WaylandCaptureProtocol::WlrScreencopy) => capture_wlr(request),
-            None => Err(CaptureError::Unsupported(
-                "Wayland compositor advertises neither ext-image-copy-capture nor wlr-screencopy".into(),
-            )),
-        }
+        capture_auto(request)
     }
 }
 

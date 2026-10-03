@@ -49,6 +49,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Action::ProbeWayland => print_wayland_probe(cli.wayland_socket.as_deref()),
         Action::ProbeExtConstraints => run_ext_constraint_probe(&cli),
+        Action::CaptureWayland => run_wayland_capture(&cli),
         Action::CaptureWlr => run_wlr_capture(&cli),
         Action::Gui => launch_gui(cli.backend.or_else(default_backend)),
     }
@@ -132,6 +133,26 @@ fn run_ext_constraint_probe(_cli: &Cli) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn run_wayland_capture(cli: &Cli) -> Result<(), String> {
+    let request = lisnap_core::CaptureRequest {
+        screen_id: cli.screen_id.clone(),
+        include_cursor: cli.include_cursor,
+        cancellation: None,
+    };
+    let frames = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::capture_wayland_socket(std::path::Path::new(path), &request),
+        None => lisnap_platform::capture_wayland(&request),
+    }
+    .map_err(|error| error.to_string())?;
+    print_capture_frames("Wayland capture", frames)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_wayland_capture(_cli: &Cli) -> Result<(), String> {
+    Err("--capture-wayland is only available on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
 fn run_wlr_capture(cli: &Cli) -> Result<(), String> {
     let request = lisnap_core::CaptureRequest {
         screen_id: cli.screen_id.clone(),
@@ -143,8 +164,13 @@ fn run_wlr_capture(cli: &Cli) -> Result<(), String> {
         None => lisnap_platform::capture_wayland_wlr(&request),
     }
     .map_err(|error| error.to_string())?;
+    print_capture_frames("wlr-screencopy", frames)
+}
+
+#[cfg(target_os = "linux")]
+fn print_capture_frames(label: &str, frames: Vec<lisnap_core::CaptureFrame>) -> Result<(), String> {
     if frames.is_empty() {
-        return Err("wlr-screencopy returned no frames".into());
+        return Err(format!("{label} returned no frames"));
     }
     for frame in frames {
         let size = frame.image.size();
