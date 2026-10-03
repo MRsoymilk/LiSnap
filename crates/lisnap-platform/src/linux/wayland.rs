@@ -336,6 +336,16 @@ fn map_ext_constraints(
         .collect())
 }
 
+pub fn capture_ext(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    ext::capture_connection(connection, request)
+}
+
+pub fn capture_ext_socket(path: &Path, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
+    ext::capture_connection(connect_socket(path)?, request)
+}
+
 pub fn capture_wlr(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
     let connection = Connection::connect_to_env()
         .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
@@ -392,7 +402,7 @@ impl CaptureBackend for WaylandBackend {
         BackendDescriptor {
             id: "wayland",
             name: "Wayland native",
-            technology: "wlr-screencopy SHM; ext-image-copy-capture negotiation",
+            technology: "ext-image-copy-capture / wlr-screencopy SHM",
             status: BackendStatus::Available,
         }
     }
@@ -430,7 +440,22 @@ impl CaptureBackend for WaylandBackend {
     }
 
     fn capture(&mut self, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
-        capture_wlr(request)
+        let probe = probe()?;
+        match probe.preferred_capture_protocol() {
+            Some(WaylandCaptureProtocol::ExtImageCopyCapture) => match capture_ext(request) {
+                Ok(frames) => Ok(frames),
+                Err(CaptureError::Unsupported(_) | CaptureError::InvalidFrame(_))
+                    if probe.wlr_screencopy_manager_bound =>
+                {
+                    capture_wlr(request)
+                }
+                Err(error) => Err(error),
+            },
+            Some(WaylandCaptureProtocol::WlrScreencopy) => capture_wlr(request),
+            None => Err(CaptureError::Unsupported(
+                "Wayland compositor advertises neither ext-image-copy-capture nor wlr-screencopy".into(),
+            )),
+        }
     }
 }
 

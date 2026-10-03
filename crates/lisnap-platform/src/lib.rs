@@ -7,7 +7,8 @@ use lisnap_core::{BackendDescriptor, BackendStatus, CaptureBackend, CaptureError
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::wayland::{
-    WaylandCaptureProtocol, WaylandExtConstraints, WaylandOutput, WaylandProbe, capture_wlr as capture_wayland_wlr,
+    WaylandCaptureProtocol, WaylandExtConstraints, WaylandOutput, WaylandProbe, capture_ext as capture_wayland_ext,
+    capture_ext_socket as capture_wayland_ext_socket, capture_wlr as capture_wayland_wlr,
     capture_wlr_socket as capture_wayland_wlr_socket, negotiate_ext_constraints as negotiate_wayland_ext_constraints,
     negotiate_ext_constraints_socket as negotiate_wayland_ext_constraints_socket, probe as probe_wayland,
     probe_socket as probe_wayland_socket,

@@ -1,20 +1,27 @@
 use std::{
     collections::BTreeMap,
-    time::{Duration, Instant},
+    ffi::CString,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    os::fd::AsFd,
+    time::{Duration, Instant, SystemTime},
 };
 
-use lisnap_core::{CaptureError, CaptureRequest, PixelSize};
+use lisnap_core::{CaptureError, CaptureFrame, CaptureRequest, PixelSize, RgbaImage, ScreenInfo};
 use rustix::{
     event::{PollFd, PollFlags, poll},
+    fs::{MemfdFlags, memfd_create},
     time::Timespec,
 };
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
-    protocol::{wl_callback, wl_display, wl_output, wl_registry, wl_shm},
+    protocol::{wl_buffer, wl_callback, wl_display, wl_output, wl_registry, wl_shm, wl_shm_pool},
 };
 use wayland_protocols::ext::{
     image_capture_source::v1::client::{ext_image_capture_source_v1, ext_output_image_capture_source_manager_v1},
-    image_copy_capture::v1::client::{ext_image_copy_capture_manager_v1, ext_image_copy_capture_session_v1},
+    image_copy_capture::v1::client::{
+        ext_image_copy_capture_frame_v1, ext_image_copy_capture_manager_v1, ext_image_copy_capture_session_v1,
+    },
 };
 
 const WL_OUTPUT_MAX_VERSION: u32 = 4;
@@ -47,12 +54,22 @@ struct ExtState {
     shm_formats: Vec<wl_shm::Format>,
     constraints_done: bool,
     session_stopped: bool,
+    shm: Option<wl_shm::WlShm>,
+    frame_state: Option<FrameState>,
+    frame_transform: Option<wl_output::Transform>,
     sync_done: bool,
 }
 
 #[derive(Debug)]
 struct OutputData {
     global_name: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrameState {
+    Waiting,
+    Ready,
+    Failed(String),
 }
 
 pub(crate) fn negotiate_connection(
@@ -129,6 +146,276 @@ pub(crate) fn negotiate_connection(
     }
 
     Ok(result)
+}
+
+pub(crate) fn capture_connection(
+    connection: Connection,
+    request: &CaptureRequest,
+) -> Result<Vec<CaptureFrame>, CaptureError> {
+    let display = connection.display();
+    let mut event_queue = connection.new_event_queue::<ExtState>();
+    let queue_handle = event_queue.handle();
+    let _registry = display.get_registry(&queue_handle, ());
+    let mut state = ExtState::default();
+
+    bounded_roundtrip(
+        &display,
+        &queue_handle,
+        &mut event_queue,
+        &mut state,
+        request,
+        "ext-image-copy-capture registry initialization",
+    )?;
+    bounded_roundtrip(
+        &display,
+        &queue_handle,
+        &mut event_queue,
+        &mut state,
+        request,
+        "ext-image-copy-capture output initialization",
+    )?;
+
+    let capture_manager = state.capture_manager.clone().ok_or_else(|| {
+        CaptureError::Unsupported("ext-image-copy-capture manager is not advertised by this compositor".into())
+    })?;
+    let source_manager = state.source_manager.clone().ok_or_else(|| {
+        CaptureError::Unsupported("ext output image capture source manager is not advertised by this compositor".into())
+    })?;
+    let shm = state
+        .shm
+        .clone()
+        .ok_or_else(|| CaptureError::Unsupported("wl_shm is not advertised by this compositor".into()))?;
+    let output_ids = select_output_ids(&state, request.screen_id.as_deref())?;
+    let mut frames = Vec::with_capacity(output_ids.len());
+
+    for output_id in output_ids {
+        ensure_not_cancelled(request)?;
+        state.constraint_size = None;
+        state.shm_formats.clear();
+        state.constraints_done = false;
+        state.session_stopped = false;
+        state.frame_state = None;
+        state.frame_transform = None;
+
+        let output = state
+            .outputs
+            .get(&output_id)
+            .ok_or_else(|| CaptureError::BackendFailure("selected Wayland output disappeared".into()))?;
+        let output_proxy = output.proxy.clone();
+        let output_name = output.name.clone().unwrap_or_else(|| output_id.to_string());
+
+        let source = source_manager.create_source(&output_proxy, &queue_handle, ());
+        let options = if request.include_cursor {
+            ext_image_copy_capture_manager_v1::Options::PaintCursors
+        } else {
+            ext_image_copy_capture_manager_v1::Options::empty()
+        };
+        let session = capture_manager.create_session(&source, options, &queue_handle, ());
+        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
+        let capture_result = (|| -> Result<CaptureFrame, CaptureError> {
+            wait_for_constraints(&mut event_queue, &mut state, request, deadline)?;
+            let size = state.constraint_size.ok_or_else(|| {
+                CaptureError::InvalidFrame("ext-image-copy-capture did not advertise a buffer size".into())
+            })?;
+            let format = select_shm_format(&state.shm_formats)?;
+            let stride = size
+                .width
+                .checked_mul(4)
+                .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture row size overflow".into()))?;
+            let byte_len = (stride as usize)
+                .checked_mul(size.height as usize)
+                .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture buffer size overflow".into()))?;
+            let size_i32 = i32::try_from(byte_len).map_err(|_| {
+                CaptureError::InvalidFrame("ext-image-copy-capture buffer exceeds protocol size".into())
+            })?;
+            let width_i32 = i32::try_from(size.width).map_err(|_| {
+                CaptureError::InvalidFrame("ext-image-copy-capture width exceeds protocol range".into())
+            })?;
+            let height_i32 = i32::try_from(size.height).map_err(|_| {
+                CaptureError::InvalidFrame("ext-image-copy-capture height exceeds protocol range".into())
+            })?;
+            let stride_i32 = i32::try_from(stride).map_err(|_| {
+                CaptureError::InvalidFrame("ext-image-copy-capture stride exceeds protocol range".into())
+            })?;
+
+            let name = CString::new("lisnap-ext-capture")
+                .map_err(|_| CaptureError::BackendFailure("invalid memfd name".into()))?;
+            let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+                .map_err(|error| CaptureError::BackendFailure(format!("memfd_create failed: {error}")))?;
+            let mut file = File::from(fd);
+            file.set_len(byte_len as u64)
+                .map_err(|error| CaptureError::BackendFailure(format!("resizing ext SHM buffer failed: {error}")))?;
+
+            let pool = shm.create_pool(file.as_fd(), size_i32, &queue_handle, ());
+            let buffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, format, &queue_handle, ());
+            pool.destroy();
+
+            state.frame_state = Some(FrameState::Waiting);
+            let frame = session.create_frame(&queue_handle, ());
+            let frame_result = (|| -> Result<CaptureFrame, CaptureError> {
+                frame.attach_buffer(&buffer);
+                frame.damage_buffer(0, 0, width_i32, height_i32);
+                frame.capture();
+                wait_for_frame(&mut event_queue, &mut state, request, Instant::now() + NEGOTIATION_TIMEOUT)?;
+
+                let mut native = vec![0_u8; byte_len];
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|error| CaptureError::BackendFailure(format!("seeking ext SHM buffer failed: {error}")))?;
+                file.read_exact(&mut native)
+                    .map_err(|error| CaptureError::BackendFailure(format!("reading ext SHM buffer failed: {error}")))?;
+
+                let rgba = convert_shm_rgba(format, size, stride, &native)?;
+                let transform = state.frame_transform.unwrap_or(wl_output::Transform::Normal);
+                let (pixel_size, rgba) = normalize_transform(size, rgba, transform)?;
+                let image = RgbaImage::new(pixel_size, rgba)?;
+                Ok(CaptureFrame {
+                    screen: ScreenInfo {
+                        id: output_name.clone(),
+                        name: output_name.clone(),
+                        logical_geometry: None,
+                        pixel_size,
+                        scale_factor: None,
+                    },
+                    image,
+                    captured_at: SystemTime::now(),
+                })
+            })();
+            frame.destroy();
+            buffer.destroy();
+            frame_result
+        })();
+        session.destroy();
+        source.destroy();
+        frames.push(capture_result?);
+    }
+
+    Ok(frames)
+}
+
+fn select_shm_format(formats: &[wl_shm::Format]) -> Result<wl_shm::Format, CaptureError> {
+    if formats.contains(&wl_shm::Format::Argb8888) {
+        Ok(wl_shm::Format::Argb8888)
+    } else if formats.contains(&wl_shm::Format::Xrgb8888) {
+        Ok(wl_shm::Format::Xrgb8888)
+    } else {
+        Err(CaptureError::Unsupported(format!("ext-image-copy-capture has no supported SHM format: {formats:?}")))
+    }
+}
+
+fn wait_for_frame(
+    event_queue: &mut wayland_client::EventQueue<ExtState>,
+    state: &mut ExtState,
+    request: &CaptureRequest,
+    deadline: Instant,
+) -> Result<(), CaptureError> {
+    loop {
+        if state.session_stopped {
+            return Err(CaptureError::BackendFailure("ext-image-copy-capture session stopped while copying".into()));
+        }
+        match state.frame_state.as_ref() {
+            Some(FrameState::Ready) => return Ok(()),
+            Some(FrameState::Failed(reason)) => {
+                return Err(CaptureError::BackendFailure(format!(
+                    "ext-image-copy-capture compositor rejected the frame: {reason}"
+                )));
+            }
+            _ => dispatch_with_deadline(event_queue, state, request, deadline, "ext-image-copy-capture frame copy")?,
+        }
+    }
+}
+
+fn convert_shm_rgba(
+    format: wl_shm::Format,
+    size: PixelSize,
+    stride: u32,
+    native: &[u8],
+) -> Result<Vec<u8>, CaptureError> {
+    let needed = (stride as usize)
+        .checked_mul(size.height as usize)
+        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture byte length overflow".into()))?;
+    if native.len() < needed {
+        return Err(CaptureError::InvalidFrame("ext-image-copy-capture SHM data is shorter than its stride".into()));
+    }
+    let row_bytes = (size.width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture row size overflow".into()))?;
+    if (stride as usize) < row_bytes {
+        return Err(CaptureError::InvalidFrame("ext-image-copy-capture stride is shorter than one row".into()));
+    }
+    let mut rgba = vec![0_u8; row_bytes * size.height as usize];
+    for y in 0..size.height as usize {
+        let src = &native[y * stride as usize..y * stride as usize + row_bytes];
+        let dst = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+        for (source, target) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            let alpha = if format == wl_shm::Format::Argb8888 { source[3] } else { 255 };
+            let (red, green, blue) = if alpha == 0 {
+                (0, 0, 0)
+            } else if alpha < 255 && format == wl_shm::Format::Argb8888 {
+                (unpremultiply(source[2], alpha), unpremultiply(source[1], alpha), unpremultiply(source[0], alpha))
+            } else {
+                (source[2], source[1], source[0])
+            };
+            target.copy_from_slice(&[red, green, blue, alpha]);
+        }
+    }
+    Ok(rgba)
+}
+
+fn unpremultiply(channel: u8, alpha: u8) -> u8 {
+    ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+}
+
+fn normalize_transform(
+    size: PixelSize,
+    rgba: Vec<u8>,
+    transform: wl_output::Transform,
+) -> Result<(PixelSize, Vec<u8>), CaptureError> {
+    let expected = (size.width as usize)
+        .checked_mul(size.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture RGBA size overflow".into()))?;
+    if rgba.len() != expected {
+        return Err(CaptureError::InvalidFrame("ext-image-copy-capture RGBA length does not match dimensions".into()));
+    }
+    if transform == wl_output::Transform::Normal {
+        return Ok((size, rgba));
+    }
+    let rotated = matches!(
+        transform,
+        wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270
+    );
+    let dst_size = if rotated { PixelSize { width: size.height, height: size.width } } else { size };
+    let mut dst = vec![0_u8; rgba.len()];
+    for y in 0..size.height {
+        for x in 0..size.width {
+            let flipped = matches!(
+                transform,
+                wl_output::Transform::Flipped
+                    | wl_output::Transform::Flipped90
+                    | wl_output::Transform::Flipped180
+                    | wl_output::Transform::Flipped270
+            );
+            let fx = if flipped { size.width - 1 - x } else { x };
+            let (dx, dy) = match transform {
+                wl_output::Transform::Normal | wl_output::Transform::Flipped => (fx, y),
+                wl_output::Transform::_90 | wl_output::Transform::Flipped90 => (size.height - 1 - y, fx),
+                wl_output::Transform::_180 | wl_output::Transform::Flipped180 => {
+                    (size.width - 1 - fx, size.height - 1 - y)
+                }
+                wl_output::Transform::_270 | wl_output::Transform::Flipped270 => (y, size.width - 1 - fx),
+                _ => {
+                    return Err(CaptureError::Unsupported(format!("unknown Wayland output transform {transform:?}")));
+                }
+            };
+            let src = ((y * size.width + x) * 4) as usize;
+            let dst_index = ((dy * dst_size.width + dx) * 4) as usize;
+            dst[dst_index..dst_index + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    Ok((dst_size, dst))
 }
 
 fn select_output_ids(state: &ExtState, requested: Option<&str>) -> Result<Vec<u32>, CaptureError> {
@@ -267,6 +554,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ExtState {
                     (),
                 ));
             }
+            wl_registry::Event::Global { name, interface, version } if interface == "wl_shm" => {
+                state.shm = Some(registry.bind(name, version.min(1), queue_handle, ()));
+            }
             wl_registry::Event::Global { name, interface, version } if interface == "wl_output" => {
                 let proxy = registry.bind(
                     name,
@@ -352,6 +642,66 @@ impl Dispatch<ext_image_capture_source_v1::ExtImageCaptureSourceV1, ()> for ExtS
     }
 }
 
+impl Dispatch<wl_shm::WlShm, ()> for ExtState {
+    fn event(
+        _state: &mut Self,
+        _shm: &wl_shm::WlShm,
+        _event: wl_shm::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for ExtState {
+    fn event(
+        _state: &mut Self,
+        _pool: &wl_shm_pool::WlShmPool,
+        _event: wl_shm_pool::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for ExtState {
+    fn event(
+        _state: &mut Self,
+        _buffer: &wl_buffer::WlBuffer,
+        _event: wl_buffer::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> for ExtState {
+    fn event(
+        state: &mut Self,
+        _frame: &ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_image_copy_capture_frame_v1::Event::Transform { transform: WEnum::Value(transform) } => {
+                state.frame_transform = Some(transform)
+            }
+            ext_image_copy_capture_frame_v1::Event::Ready => {
+                state.frame_state = Some(FrameState::Ready);
+            }
+            ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
+                state.frame_state = Some(FrameState::Failed(format!("{reason:?}")));
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, ()> for ExtState {
     fn event(
         state: &mut Self,
@@ -391,5 +741,30 @@ mod tests {
         assert!(ensure_not_cancelled(&request).is_ok());
         cancellation.cancel();
         assert!(matches!(ensure_not_cancelled(&request), Err(CaptureError::Cancelled)));
+    }
+
+    #[test]
+    fn converts_xrgb_to_rgba() {
+        let size = PixelSize { width: 2, height: 1 };
+        let native = [3, 2, 1, 0, 30, 20, 10, 0];
+        let rgba = convert_shm_rgba(wl_shm::Format::Xrgb8888, size, 8, &native).unwrap();
+        assert_eq!(rgba, vec![1, 2, 3, 255, 10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn rotates_rgba_90_degrees() {
+        let size = PixelSize { width: 2, height: 1 };
+        let rgba = vec![1, 0, 0, 255, 2, 0, 0, 255];
+        let (size, rotated) = normalize_transform(size, rgba, wl_output::Transform::_90).unwrap();
+        assert_eq!(size, PixelSize { width: 1, height: 2 });
+        assert_eq!(rotated, vec![1, 0, 0, 255, 2, 0, 0, 255]);
+    }
+
+    #[test]
+    fn chooses_argb_before_xrgb() {
+        assert_eq!(
+            select_shm_format(&[wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888]).unwrap(),
+            wl_shm::Format::Argb8888
+        );
     }
 }
