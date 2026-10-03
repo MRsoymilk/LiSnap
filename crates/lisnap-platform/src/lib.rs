@@ -7,12 +7,15 @@ use lisnap_core::{BackendDescriptor, BackendStatus, CaptureBackend, CaptureError
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::wayland::{
-    WaylandCaptureProtocol, WaylandExtConstraints, WaylandOutput, WaylandOverlayLifecycle, WaylandProbe,
-    capture_auto as capture_wayland, capture_auto_socket as capture_wayland_socket, capture_ext as capture_wayland_ext,
-    capture_ext_socket as capture_wayland_ext_socket, capture_wlr as capture_wayland_wlr,
-    capture_wlr_socket as capture_wayland_wlr_socket, negotiate_ext_constraints as negotiate_wayland_ext_constraints,
+    WaylandCaptureProtocol, WaylandExtConstraints, WaylandOutput, WaylandOverlayLifecycle, WaylandOverlayOutcome,
+    WaylandProbe, capture_auto as capture_wayland, capture_auto_socket as capture_wayland_socket,
+    capture_ext as capture_wayland_ext, capture_ext_socket as capture_wayland_ext_socket,
+    capture_wlr as capture_wayland_wlr, capture_wlr_socket as capture_wayland_wlr_socket,
+    negotiate_ext_constraints as negotiate_wayland_ext_constraints,
     negotiate_ext_constraints_socket as negotiate_wayland_ext_constraints_socket, probe as probe_wayland,
-    probe_socket as probe_wayland_socket, validate_overlay_lifecycle as validate_wayland_overlay_lifecycle,
+    probe_socket as probe_wayland_socket, run_frozen_overlay as run_wayland_frozen_overlay,
+    run_frozen_overlay_socket as run_wayland_frozen_overlay_socket,
+    validate_overlay_lifecycle as validate_wayland_overlay_lifecycle,
     validate_overlay_lifecycle_socket as validate_wayland_overlay_lifecycle_socket,
 };
 #[cfg(target_os = "macos")]

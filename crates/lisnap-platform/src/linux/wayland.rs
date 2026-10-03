@@ -1,6 +1,7 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
 mod ext;
 mod overlay;
+mod overlay_runtime;
 mod shm;
 mod wlr;
 
@@ -12,7 +13,8 @@ use std::{
 };
 
 use lisnap_core::{
-    BackendDescriptor, BackendStatus, CaptureBackend, CaptureError, CaptureFrame, CaptureRequest, PixelSize, ScreenInfo,
+    BackendDescriptor, BackendStatus, CaptureBackend, CaptureError, CaptureFrame, CaptureRequest, PixelRect, PixelSize,
+    ScreenInfo,
 };
 use rustix::{
     event::{PollFd, PollFlags, poll},
@@ -76,6 +78,13 @@ pub struct WaylandOverlayLifecycle {
     pub output_id: String,
     pub configured_size: PixelSize,
     pub layer_shell_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaylandOverlayOutcome {
+    Selected(PixelRect),
+    Cancelled,
+    Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +398,24 @@ fn map_overlay_lifecycle(lifecycle: overlay::OverlayLifecycle) -> Result<Wayland
         output_id: lifecycle.output_id,
         configured_size: lifecycle.configured_size,
         layer_shell_version: lifecycle.layer_shell_version,
+    })
+}
+
+pub fn run_frozen_overlay(frame: &CaptureFrame) -> Result<WaylandOverlayOutcome, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    map_overlay_outcome(overlay_runtime::run_connection(connection, frame)?)
+}
+
+pub fn run_frozen_overlay_socket(path: &Path, frame: &CaptureFrame) -> Result<WaylandOverlayOutcome, CaptureError> {
+    map_overlay_outcome(overlay_runtime::run_connection(connect_socket(path)?, frame)?)
+}
+
+fn map_overlay_outcome(outcome: overlay_runtime::FrozenOverlayOutcome) -> Result<WaylandOverlayOutcome, CaptureError> {
+    Ok(match outcome {
+        overlay_runtime::FrozenOverlayOutcome::Selected(rect) => WaylandOverlayOutcome::Selected(rect),
+        overlay_runtime::FrozenOverlayOutcome::Cancelled => WaylandOverlayOutcome::Cancelled,
+        overlay_runtime::FrozenOverlayOutcome::Closed => WaylandOverlayOutcome::Closed,
     })
 }
 
