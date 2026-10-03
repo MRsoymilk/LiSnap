@@ -48,6 +48,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Action::ProbeWayland => print_wayland_probe(cli.wayland_socket.as_deref()),
+        Action::ProbeExtConstraints => run_ext_constraint_probe(&cli),
         Action::CaptureWlr => run_wlr_capture(&cli),
         Action::Gui => launch_gui(cli.backend.or_else(default_backend)),
     }
@@ -99,6 +100,35 @@ fn print_wayland_probe(socket: Option<&str>) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn print_wayland_probe(_socket: Option<&str>) -> Result<(), String> {
     Err("--probe-wayland is only available on Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn run_ext_constraint_probe(cli: &Cli) -> Result<(), String> {
+    let request =
+        lisnap_core::CaptureRequest { screen_id: cli.screen_id.clone(), include_cursor: false, cancellation: None };
+    let constraints = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::negotiate_wayland_ext_constraints_socket(std::path::Path::new(path), &request),
+        None => lisnap_platform::negotiate_wayland_ext_constraints(&request),
+    }
+    .map_err(|error| error.to_string())?;
+    if constraints.is_empty() {
+        return Err("ext-image-copy-capture returned no output constraints".into());
+    }
+    for constraint in constraints {
+        println!(
+            "{} | {}x{} | SHM {}",
+            constraint.output_id,
+            constraint.pixel_size.width,
+            constraint.pixel_size.height,
+            constraint.shm_formats.join(",")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_ext_constraint_probe(_cli: &Cli) -> Result<(), String> {
+    Err("--probe-ext-constraints is only available on Linux".into())
 }
 
 #[cfg(target_os = "linux")]

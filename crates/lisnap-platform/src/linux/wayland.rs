@@ -1,4 +1,5 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
+mod ext;
 mod wlr;
 
 use std::{collections::BTreeMap, os::unix::net::UnixStream, path::Path};
@@ -49,6 +50,13 @@ pub struct WaylandOutput {
     pub model: Option<String>,
     pub scale_factor: Option<i32>,
     pub pixel_size: Option<PixelSize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaylandExtConstraints {
+    pub output_id: String,
+    pub pixel_size: PixelSize,
+    pub shm_formats: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +308,32 @@ pub fn probe() -> Result<WaylandProbe, CaptureError> {
 pub fn probe_socket(path: &Path) -> Result<WaylandProbe, CaptureError> {
     let connection = connect_socket(path)?;
     probe_connection(connection)
+}
+
+pub fn negotiate_ext_constraints(request: &CaptureRequest) -> Result<Vec<WaylandExtConstraints>, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    map_ext_constraints(ext::negotiate_connection(connection, request)?)
+}
+
+pub fn negotiate_ext_constraints_socket(
+    path: &Path,
+    request: &CaptureRequest,
+) -> Result<Vec<WaylandExtConstraints>, CaptureError> {
+    map_ext_constraints(ext::negotiate_connection(connect_socket(path)?, request)?)
+}
+
+fn map_ext_constraints(
+    constraints: Vec<ext::ExtCaptureConstraints>,
+) -> Result<Vec<WaylandExtConstraints>, CaptureError> {
+    Ok(constraints
+        .into_iter()
+        .map(|constraint| WaylandExtConstraints {
+            output_id: constraint.output_id,
+            pixel_size: constraint.pixel_size,
+            shm_formats: constraint.shm_formats.into_iter().map(|format| format!("{format:?}")).collect(),
+        })
+        .collect())
 }
 
 pub fn capture_wlr(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {

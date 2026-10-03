@@ -1,6 +1,6 @@
 use lisnap_platform::BackendKind;
 
-pub const HELP: &str = "LiSnap - cross-platform screenshot tool (framework stage)\n\nUsage: lisnap [--backend auto|wayland|x11|windows|macos]\n       lisnap --list-backends\n       lisnap --probe-wayland [--wayland-socket PATH]\n       lisnap --capture-wlr [--wayland-socket PATH] [--screen ID] [--include-cursor]\n       lisnap --help\n       lisnap --version\n\nWithout options, opens the desktop shell. Native capture is still under active implementation.\n--list-backends does not open a window or request screen access.\n--probe-wayland reports outputs/capture protocols without capturing pixels.\n--capture-wlr performs direct wlr-screencopy SHM capture and prints frame metadata/checksums without saving files.\n";
+pub const HELP: &str = "LiSnap - cross-platform screenshot tool (framework stage)\n\nUsage: lisnap [--backend auto|wayland|x11|windows|macos]\n       lisnap --list-backends\n       lisnap --probe-wayland [--wayland-socket PATH]\n       lisnap --probe-ext-constraints [--wayland-socket PATH] [--screen ID]\n       lisnap --capture-wlr [--wayland-socket PATH] [--screen ID] [--include-cursor]\n       lisnap --help\n       lisnap --version\n\nWithout options, opens the desktop shell. Native capture is still under active implementation.\n--list-backends does not open a window or request screen access.\n--probe-wayland reports outputs/capture protocols without capturing pixels.\n--probe-ext-constraints creates an ext-image-copy-capture session and reports SHM constraints without capturing pixels.\n--capture-wlr performs direct wlr-screencopy SHM capture and prints frame metadata/checksums without saving files.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
@@ -8,6 +8,7 @@ pub enum Action {
     Gui,
     ListBackends,
     ProbeWayland,
+    ProbeExtConstraints,
     CaptureWlr,
     Help,
     Version,
@@ -36,6 +37,7 @@ impl Cli {
                 "-V" | "--version" => Some(Action::Version),
                 "--list-backends" => Some(Action::ListBackends),
                 "--probe-wayland" => Some(Action::ProbeWayland),
+                "--probe-ext-constraints" => Some(Action::ProbeExtConstraints),
                 "--capture-wlr" => Some(Action::CaptureWlr),
                 "--wayland-socket" => {
                     if wayland_socket_seen {
@@ -74,7 +76,7 @@ impl Cli {
             if let Some(action) = action {
                 if action_seen {
                     return Err(
-                        "choose only one of --help, --version, --list-backends, --probe-wayland, or --capture-wlr"
+                        "choose only one of --help, --version, --list-backends, --probe-wayland, --probe-ext-constraints, or --capture-wlr"
                             .into(),
                     );
                 }
@@ -82,11 +84,16 @@ impl Cli {
                 action_seen = true;
             }
         }
-        if cli.wayland_socket.is_some() && !matches!(cli.action, Action::ProbeWayland | Action::CaptureWlr) {
-            return Err("--wayland-socket requires --probe-wayland or --capture-wlr".into());
+        if cli.wayland_socket.is_some()
+            && !matches!(cli.action, Action::ProbeWayland | Action::ProbeExtConstraints | Action::CaptureWlr)
+        {
+            return Err("--wayland-socket requires --probe-wayland, --probe-ext-constraints, or --capture-wlr".into());
         }
-        if (cli.screen_id.is_some() || cli.include_cursor) && cli.action != Action::CaptureWlr {
-            return Err("--screen and --include-cursor require --capture-wlr".into());
+        if cli.screen_id.is_some() && !matches!(cli.action, Action::ProbeExtConstraints | Action::CaptureWlr) {
+            return Err("--screen requires --probe-ext-constraints or --capture-wlr".into());
+        }
+        if cli.include_cursor && cli.action != Action::CaptureWlr {
+            return Err("--include-cursor requires --capture-wlr".into());
         }
         Ok(cli)
     }
@@ -110,6 +117,9 @@ mod tests {
         assert_eq!(parse(&["--backend", "auto"]).unwrap().backend, None);
         assert_eq!(parse(&["--list-backends"]).unwrap().action, Action::ListBackends);
         assert_eq!(parse(&["--probe-wayland"]).unwrap().action, Action::ProbeWayland);
+        let ext = parse(&["--probe-ext-constraints", "--screen", "DP-1"]).unwrap();
+        assert_eq!(ext.action, Action::ProbeExtConstraints);
+        assert_eq!(ext.screen_id.as_deref(), Some("DP-1"));
         let capture = parse(&["--capture-wlr", "--screen", "DP-1", "--include-cursor"]).unwrap();
         assert_eq!(capture.action, Action::CaptureWlr);
         assert_eq!(capture.screen_id.as_deref(), Some("DP-1"));
@@ -137,6 +147,7 @@ mod tests {
         assert!(parse(&["--list-backends", "--version"]).is_err());
         assert!(parse(&["--probe-wayland", "--help"]).is_err());
         assert!(parse(&["--capture-wlr", "--version"]).is_err());
+        assert!(parse(&["--probe-ext-constraints", "--help"]).is_err());
         assert!(parse(&["--wayland-socket", "/run/user/1000/wayland-1"]).is_err());
         assert!(parse(&["--screen", "DP-1"]).is_err());
         assert!(parse(&["--include-cursor"]).is_err());
