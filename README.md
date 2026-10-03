@@ -2,7 +2,7 @@
 
 使用 Rust 开发的跨平台截屏工具。当前版本 `0.1.0`，处于项目框架阶段，不依赖 Qt。
 
-**当前没有真实截图功能。** 桌面窗口代码已建立，但所有平台捕获后端都是明确返回 `NotImplemented` 的占位实现；不会返回模拟桌面、空图片或虚假的成功结果。
+Linux/Wayland 已实现真实单帧捕获：优先使用 `ext-image-copy-capture`，不可用时回退 `wlr-screencopy`，两条路径都直接使用 SHM，不经过 Portal。X11、Windows、macOS 仍是明确失败的占位实现；不会返回模拟桌面、空图片或虚假的成功结果。
 
 ## 技术结构
 
@@ -15,12 +15,13 @@ LiSnap/
 ├── crates/
 │   ├── lisnap-core/              # 截图类型、不可变 RGBA8 图像、裁剪、坐标换算
 │   ├── lisnap-platform/src/
-│   │   ├── linux/wayland.rs      # 直连 Wayland 的后续实现入口
+│   │   ├── linux/wayland.rs      # Wayland 探测、协议选择与统一捕获入口
 │   │   ├── linux/x11.rs          # X11 的后续实现入口
 │   │   ├── windows/mod.rs        # Windows 原生后端入口
 │   │   └── macos/mod.rs          # macOS 原生后端入口
 │   └── lisnap-ui/                # egui/eframe 桌面窗口
 ├── scripts/check-core.sh        # Unix 离线核心/CLI 检查
+├── scripts/validate-wayland.sh  # 真实 Wayland 会话探测与帧捕获验收
 ├── docs/architecture.md          # 边界、坐标和捕获约定
 └── plans/README.md               # 分阶段开发顺序
 ```
@@ -36,11 +37,13 @@ cargo run -p lisnap
 cargo run -p lisnap -- --backend wayland
 cargo run -p lisnap -- --list-backends
 cargo run -p lisnap --no-default-features -- --list-backends
+cargo run -p lisnap --no-default-features -- --probe-wayland
+cargo run -p lisnap --no-default-features -- --capture-wayland
 ```
 
 不带参数时启动桌面框架窗口。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`；指定非本机平台的后端会报错。`--list-backends` 只显示后端清单，不打开窗口、不请求屏幕内容。
 
-自动选择只依据操作系统及会话环境提示，不代表协议存在、权限获准或捕获可用。没有桌面会话时显示 `none`，不伪造显示器信息。
+自动后端候选仍只依据操作系统及会话环境提示；真正捕获时会连接 Wayland registry 并按实际绑定能力选择 `ext-image-copy-capture` 或 `wlr-screencopy`。没有桌面会话、协议缺失、权限拒绝或帧约束不兼容时会明确失败，不伪造显示器信息。
 
 ## 验证
 
@@ -60,14 +63,26 @@ sh scripts/check-core.sh
 ./target/standalone-check/lisnap --list-backends
 ```
 
-该脚本通过 rustc 编译核心库、平台库、19 个测试以及无 GUI 的 CLI，开启 `-D warnings` 和 `-D unsafe_code`。产物位于 `target/standalone-check/`。它不验证 eframe/wgpu、Cargo 特性解析或其他操作系统的原生实现，不可替代完整 Cargo 检查。
+该脚本通过 rustc 编译核心库、平台库和无 GUI CLI 的离线子集，开启 `-D warnings` 和 `-D unsafe_code`。产物位于 `target/standalone-check/`。它不验证 Wayland 第三方协议依赖、eframe/wgpu、Cargo 特性解析或其他操作系统的原生实现，不可替代完整 Cargo 检查。
+
+真实 Wayland 捕获必须在能够访问 compositor socket 的桌面会话中验证：
+
+```sh
+sh scripts/validate-wayland.sh
+# 指定输出时：
+LISNAP_SCREEN=DP-1 sh scripts/validate-wayland.sh
+# 服务/容器环境可显式指定 socket：
+LISNAP_WAYLAND_SOCKET=/run/user/1000/wayland-1 sh scripts/validate-wayland.sh
+```
+
+脚本先执行 `--probe-wayland`，随后执行 `--capture-wayland`。成功时输出每个捕获帧的输出 ID、像素尺寸、RGBA 字节数和 FNV64 校验和；它不打开截图选择 UI，也不会写入截图文件。
 
 ### 当前验证结果
 
-在本机 Linux / rustc 1.97.1 上，Cargo 依赖已经解析并生成 `Cargo.lock`；格式检查、19 个离线核心/CLI 测试、无显示服务器的一帧 egui UI 布局 smoke test、完整 workspace `cargo check`、`cargo clippy -D warnings` 以及带 GUI 特性的二进制编译/链接和 `--version` 运行均已通过。自动化 shell 本身没有继承桌面环境变量，但 `/run/user/1000/wayland-1` 可访问；显式设置 `XDG_RUNTIME_DIR=/run/user/1000` 与 `WAYLAND_DISPLAY=wayland-1` 后，完整 GUI 二进制持续运行 5 秒且无启动错误，因此 Linux/Wayland 原生窗口启动已验证。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，原生 runner 会执行 workspace check、平台后端测试和无 GUI CLI 测试，仍需等待远端实际运行后才能验收这两项。
+在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI 测试、`cargo clippy --workspace --all-targets -- -D warnings` 以及 GUI 启动验证均已通过。Wayland 代码现已覆盖 registry/output 枚举、ext/wlr manager 绑定、SHM 单帧复制、ARGB/XRGB 转换、stride、Y-invert/transform、cursor option、5 秒超时和取消。当前自动化执行环境的 bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实桌面像素仍必须通过 `scripts/validate-wayland.sh` 在宿主 Wayland 会话中完成最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后验收。
 
 ## 当前范围
 
-已实现 workspace、CLI、桌面窗口源码、平台接口与占位后端、只读像素数据、裁剪、负坐标/分数缩放选区换算及基础测试。未实现真实屏幕捕获、全屏冻结覆盖层、鼠标框选交互、标注、PNG 导出、剪贴板、全局快捷键和托盘。
+已实现 workspace、CLI、桌面窗口源码、平台接口、Linux/Wayland 原生单帧捕获、只读像素数据、裁剪、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 捕获仍未实现；全屏冻结覆盖层、鼠标框选交互、标注、PNG 导出、剪贴板、全局快捷键和托盘也仍待开发。
 
-下一步优先完成 **Wayland 协议能力探测与单显示器帧捕获**，然后接入多屏覆盖层。不要将普通桌面窗口当成已实现的跨平台截屏 Overlay。
+下一步先完成 **Wayland 真机像素验收**，确认实际 compositor 输出可读且不包含自身选择 UI；之后进入静态覆盖层与选区阶段。不要将普通桌面窗口当成已实现的跨平台截屏 Overlay。
