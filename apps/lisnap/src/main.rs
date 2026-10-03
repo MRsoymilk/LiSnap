@@ -47,12 +47,34 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
+        Action::ListScreens => list_screens(cli.backend.or_else(default_backend)),
         Action::ProbeWayland => print_wayland_probe(cli.wayland_socket.as_deref()),
         Action::ProbeExtConstraints => run_ext_constraint_probe(&cli),
         Action::CaptureWayland => run_wayland_capture(&cli),
         Action::CaptureWlr => run_wlr_capture(&cli),
         Action::Gui => launch_gui(cli.backend.or_else(default_backend)),
     }
+}
+
+fn list_screens(kind: Option<BackendKind>) -> Result<(), String> {
+    let kind = kind.ok_or("no native backend candidate; specify --backend explicitly")?;
+    let mut backend = lisnap_platform::create_backend(kind).map_err(|error| error.to_string())?;
+    let screens = backend.screens().map_err(|error| error.to_string())?;
+    if screens.is_empty() {
+        return Err(format!("{kind} returned no screens"));
+    }
+    println!("{} screens: {}", kind, screens.len());
+    for screen in screens {
+        println!(
+            "{} | {} | {}x{} | scale {}",
+            screen.id,
+            screen.name,
+            screen.pixel_size.width,
+            screen.pixel_size.height,
+            screen.scale_factor.map_or_else(|| "unknown".into(), |scale| scale.to_string())
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

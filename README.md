@@ -37,11 +37,12 @@ cargo run -p lisnap
 cargo run -p lisnap -- --backend wayland
 cargo run -p lisnap -- --list-backends
 cargo run -p lisnap --no-default-features -- --list-backends
+cargo run -p lisnap --no-default-features -- --list-screens
 cargo run -p lisnap --no-default-features -- --probe-wayland
 cargo run -p lisnap --no-default-features -- --capture-wayland
 ```
 
-不带参数时启动桌面框架窗口。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`；指定非本机平台的后端会报错。`--list-backends` 只显示后端清单，不打开窗口、不请求屏幕内容。
+不带参数时启动桌面框架窗口。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`；指定非本机平台的后端会报错。`--list-backends` 只显示后端清单；`--list-screens` 通过选定的 `CaptureBackend::screens()` 输出稳定 screen ID、名称、像素尺寸和 scale，不捕获屏幕像素。
 
 自动后端候选仍只依据操作系统及会话环境提示；真正捕获时会连接 Wayland registry 并按实际绑定能力选择 `ext-image-copy-capture` 或 `wlr-screencopy`。没有桌面会话、协议缺失、权限拒绝或帧约束不兼容时会明确失败，不伪造显示器信息。
 
