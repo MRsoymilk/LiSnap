@@ -16,8 +16,8 @@ use rustix::{
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_display, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat,
-        wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_display, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry,
+        wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
@@ -46,9 +46,34 @@ struct OutputRecord {
     name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RectI {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug)]
+struct OverlayQuad {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    viewport: wp_viewport::WpViewport,
+}
+
+#[derive(Debug)]
+struct OverlayVisuals {
+    mask_quads: Vec<OverlayQuad>,
+    border_quads: Vec<OverlayQuad>,
+    mask_buffer: wl_buffer::WlBuffer,
+    border_buffer: wl_buffer::WlBuffer,
+    _solid_file: File,
+}
+
 #[derive(Debug, Default)]
 struct RuntimeState {
     compositor: Option<wl_compositor::WlCompositor>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     shm: Option<wl_shm::WlShm>,
     viewporter: Option<wp_viewporter::WpViewporter>,
@@ -63,12 +88,162 @@ struct RuntimeState {
     pointer_position: Option<(f64, f64)>,
     drag_anchor: Option<(f64, f64)>,
     outcome: Option<FrozenOverlayOutcome>,
+    visuals: Option<OverlayVisuals>,
     closed: bool,
 }
 
 #[derive(Debug)]
 struct OutputData {
     global_name: u32,
+}
+
+impl OverlayVisuals {
+    fn new(
+        compositor: &wl_compositor::WlCompositor,
+        subcompositor: &wl_subcompositor::WlSubcompositor,
+        viewporter: &wp_viewporter::WpViewporter,
+        shm: &wl_shm::WlShm,
+        parent: &wl_surface::WlSurface,
+        logical_size: PixelSize,
+        queue_handle: &QueueHandle<RuntimeState>,
+    ) -> Result<Self, CaptureError> {
+        let name = CString::new("lisnap-overlay-visuals")
+            .map_err(|_| CaptureError::BackendFailure("invalid overlay visual memfd name".into()))?;
+        let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+            .map_err(|error| CaptureError::BackendFailure(format!("overlay visual memfd_create failed: {error}")))?;
+        let mut file = File::from(fd);
+        file.set_len(8)
+            .map_err(|error| CaptureError::BackendFailure(format!("resizing overlay visual SHM failed: {error}")))?;
+        file.write_all(&[0, 0, 0, 144, 255, 255, 255, 0])
+            .map_err(|error| CaptureError::BackendFailure(format!("writing overlay visual SHM failed: {error}")))?;
+
+        let pool = shm.create_pool(file.as_fd(), 8, queue_handle, ());
+        let mask_buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, queue_handle, ());
+        let border_buffer = pool.create_buffer(4, 1, 1, 4, wl_shm::Format::Xrgb8888, queue_handle, ());
+        pool.destroy();
+
+        let mut mask_quads = Vec::with_capacity(4);
+        let mut border_quads = Vec::with_capacity(4);
+        for _ in 0..4 {
+            mask_quads.push(Self::create_quad(compositor, subcompositor, viewporter, parent, queue_handle));
+            border_quads.push(Self::create_quad(compositor, subcompositor, viewporter, parent, queue_handle));
+        }
+
+        let visuals = Self { mask_quads, border_quads, mask_buffer, border_buffer, _solid_file: file };
+        visuals.update_selection(None, None, logical_size);
+        Ok(visuals)
+    }
+
+    fn create_quad(
+        compositor: &wl_compositor::WlCompositor,
+        subcompositor: &wl_subcompositor::WlSubcompositor,
+        viewporter: &wp_viewporter::WpViewporter,
+        parent: &wl_surface::WlSurface,
+        queue_handle: &QueueHandle<RuntimeState>,
+    ) -> OverlayQuad {
+        let surface = compositor.create_surface(queue_handle, ());
+        let empty_input = compositor.create_region(queue_handle, ());
+        surface.set_input_region(Some(&empty_input));
+        empty_input.destroy();
+        let subsurface = subcompositor.get_subsurface(&surface, parent, queue_handle, ());
+        subsurface.set_desync();
+        let viewport = viewporter.get_viewport(&surface, queue_handle, ());
+        OverlayQuad { surface, subsurface, viewport }
+    }
+
+    fn update_selection(&self, start: Option<(f64, f64)>, end: Option<(f64, f64)>, logical_size: PixelSize) {
+        let width = i32::try_from(logical_size.width).unwrap_or(i32::MAX);
+        let height = i32::try_from(logical_size.height).unwrap_or(i32::MAX);
+        let full = RectI { x: 0, y: 0, width, height };
+        let Some((start, end)) = start.zip(end) else {
+            self.show_full_mask(full);
+            return;
+        };
+        let Some((masks, borders)) = selection_visual_rects(start, end, logical_size) else {
+            self.show_full_mask(full);
+            return;
+        };
+
+        for (quad, rect) in self.mask_quads.iter().zip(masks) {
+            self.set_quad(quad, &self.mask_buffer, rect);
+        }
+        for (quad, rect) in self.border_quads.iter().zip(borders) {
+            self.set_quad(quad, &self.border_buffer, rect);
+        }
+    }
+
+    fn show_full_mask(&self, full: RectI) {
+        self.set_quad(&self.mask_quads[0], &self.mask_buffer, full);
+        for quad in &self.mask_quads[1..] {
+            self.hide_quad(quad);
+        }
+        for quad in &self.border_quads {
+            self.hide_quad(quad);
+        }
+    }
+
+    fn set_quad(&self, quad: &OverlayQuad, buffer: &wl_buffer::WlBuffer, rect: RectI) {
+        if rect.width <= 0 || rect.height <= 0 {
+            self.hide_quad(quad);
+            return;
+        }
+        quad.subsurface.set_position(rect.x, rect.y);
+        quad.viewport.set_destination(rect.width, rect.height);
+        quad.surface.attach(Some(buffer), 0, 0);
+        quad.surface.damage_buffer(0, 0, 1, 1);
+        quad.surface.commit();
+    }
+
+    fn hide_quad(&self, quad: &OverlayQuad) {
+        quad.surface.attach(None, 0, 0);
+        quad.surface.commit();
+    }
+
+    fn destroy(self) {
+        for quad in self.mask_quads.into_iter().chain(self.border_quads) {
+            quad.viewport.destroy();
+            quad.subsurface.destroy();
+            quad.surface.destroy();
+        }
+        self.mask_buffer.destroy();
+        self.border_buffer.destroy();
+    }
+}
+
+fn selection_visual_rects(
+    start: (f64, f64),
+    end: (f64, f64),
+    logical_size: PixelSize,
+) -> Option<([RectI; 4], [RectI; 4])> {
+    let width = i32::try_from(logical_size.width).unwrap_or(i32::MAX);
+    let height = i32::try_from(logical_size.height).unwrap_or(i32::MAX);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let x1 = start.0.min(end.0).floor().clamp(0.0, f64::from(width)) as i32;
+    let y1 = start.1.min(end.1).floor().clamp(0.0, f64::from(height)) as i32;
+    let x2 = start.0.max(end.0).ceil().clamp(0.0, f64::from(width)) as i32;
+    let y2 = start.1.max(end.1).ceil().clamp(0.0, f64::from(height)) as i32;
+    if x2 <= x1 || y2 <= y1 {
+        return None;
+    }
+
+    let selection_width = x2 - x1;
+    let selection_height = y2 - y1;
+    let masks = [
+        RectI { x: 0, y: 0, width, height: y1 },
+        RectI { x: 0, y: y2, width, height: height - y2 },
+        RectI { x: 0, y: y1, width: x1, height: selection_height },
+        RectI { x: x2, y: y1, width: width - x2, height: selection_height },
+    ];
+    let thickness = 2_i32.min(selection_width).min(selection_height).max(1);
+    let borders = [
+        RectI { x: x1, y: y1, width: selection_width, height: thickness },
+        RectI { x: x1, y: y2 - thickness, width: selection_width, height: thickness },
+        RectI { x: x1, y: y1, width: thickness, height: selection_height },
+        RectI { x: x2 - thickness, y: y1, width: thickness, height: selection_height },
+    ];
+    Some((masks, borders))
 }
 
 pub(crate) fn run_connection(
@@ -94,10 +269,18 @@ pub(crate) fn run_connection(
         .compositor
         .clone()
         .ok_or_else(|| CaptureError::Unsupported("wl_compositor is not advertised by this compositor".into()))?;
+    let subcompositor = state
+        .subcompositor
+        .clone()
+        .ok_or_else(|| CaptureError::Unsupported("wl_subcompositor is not advertised by this compositor".into()))?;
     let layer_shell = state
         .layer_shell
         .clone()
         .ok_or_else(|| CaptureError::Unsupported("zwlr_layer_shell_v1 is not advertised by this compositor".into()))?;
+    let viewporter = state
+        .viewporter
+        .clone()
+        .ok_or_else(|| CaptureError::Unsupported("wp_viewporter is not advertised by this compositor".into()))?;
     let shm = state
         .shm
         .clone()
@@ -168,12 +351,6 @@ pub(crate) fn run_connection(
     pool.destroy();
 
     let viewport = if frame_size.width != logical_width || frame_size.height != logical_height {
-        let viewporter = state.viewporter.clone().ok_or_else(|| {
-            CaptureError::Unsupported(format!(
-                "wp_viewporter is required to scale captured {}x{} pixels into {}x{} overlay coordinates",
-                frame_size.width, frame_size.height, logical_width, logical_height
-            ))
-        })?;
         let viewport = viewporter.get_viewport(&surface, &queue_handle, ());
         viewport.set_destination(
             i32::try_from(logical_width)
@@ -189,12 +366,25 @@ pub(crate) fn run_connection(
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width_i32, height_i32);
     surface.commit();
+
+    state.visuals = Some(OverlayVisuals::new(
+        &compositor,
+        &subcompositor,
+        &viewporter,
+        &shm,
+        &surface,
+        PixelSize { width: logical_width, height: logical_height },
+        &queue_handle,
+    )?);
     event_queue
         .flush()
         .map_err(|error| CaptureError::BackendFailure(format!("mapping Wayland overlay failed: {error}")))?;
 
     let outcome = run_input_loop(&mut event_queue, &mut state);
 
+    if let Some(visuals) = state.visuals.take() {
+        visuals.destroy();
+    }
     surface.attach(None, 0, 0);
     surface.commit();
     let _ = event_queue.roundtrip(&mut state);
@@ -349,6 +539,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for RuntimeState {
             wl_registry::Event::Global { name, interface, version } if interface == "wl_compositor" => {
                 state.compositor = Some(registry.bind(name, version.min(WL_COMPOSITOR_MAX_VERSION), queue_handle, ()));
             }
+            wl_registry::Event::Global { name, interface, version } if interface == "wl_subcompositor" => {
+                state.subcompositor = Some(registry.bind(name, version.min(1), queue_handle, ()));
+            }
             wl_registry::Event::Global { name, interface, version } if interface == LAYER_SHELL => {
                 state.layer_shell = Some(registry.bind(name, version.min(LAYER_SHELL_MAX_VERSION), queue_handle, ()));
             }
@@ -400,6 +593,42 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for RuntimeState {
         _state: &mut Self,
         _proxy: &wl_compositor::WlCompositor,
         _event: wl_compositor::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for RuntimeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_subcompositor::WlSubcompositor,
+        _event: wl_subcompositor::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_subsurface::WlSubsurface, ()> for RuntimeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_subsurface::WlSubsurface,
+        _event: wl_subsurface::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_region::WlRegion, ()> for RuntimeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_region::WlRegion,
+        _event: wl_region::Event,
         _data: &(),
         _connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
@@ -462,25 +691,46 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
         _pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _data: &(),
-        _connection: &Connection,
+        connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
         match event {
             wl_pointer::Event::Enter { surface_x, surface_y, .. }
             | wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
-                state.pointer_position = Some((surface_x, surface_y));
+                let current = (surface_x, surface_y);
+                state.pointer_position = Some(current);
+                if let (Some(anchor), Some(logical_size), Some(visuals)) =
+                    (state.drag_anchor, state.logical_size, state.visuals.as_ref())
+                {
+                    visuals.update_selection(Some(anchor), Some(current), logical_size);
+                    let _ = connection.flush();
+                }
             }
             wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. } if button == BTN_LEFT => {
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
                         state.drag_anchor = state.pointer_position;
+                        if let (Some(current), Some(logical_size), Some(visuals)) =
+                            (state.pointer_position, state.logical_size, state.visuals.as_ref())
+                        {
+                            visuals.update_selection(Some(current), Some(current), logical_size);
+                            let _ = connection.flush();
+                        }
                     }
                     wl_pointer::ButtonState::Released => {
                         if let (Some(anchor), Some(current), Some(logical_size), Some(frame_size)) =
                             (state.drag_anchor.take(), state.pointer_position, state.logical_size, state.frame_size)
-                            && let Some(selection) = pointer_selection(anchor, current, logical_size, frame_size)
                         {
-                            state.outcome = Some(FrozenOverlayOutcome::Selected(selection));
+                            if let Some(visuals) = state.visuals.as_ref() {
+                                visuals.update_selection(Some(anchor), Some(current), logical_size);
+                                let _ = connection.flush();
+                            }
+                            if let Some(selection) = pointer_selection(anchor, current, logical_size, frame_size) {
+                                state.outcome = Some(FrozenOverlayOutcome::Selected(selection));
+                            } else if let Some(visuals) = state.visuals.as_ref() {
+                                visuals.update_selection(None, None, logical_size);
+                                let _ = connection.flush();
+                            }
                         }
                     }
                     _ => {}
@@ -621,5 +871,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection, PixelRect { x: 200, y: 100, width: 800, height: 400 });
+    }
+
+    #[test]
+    fn selection_visuals_cover_outside_and_border_inside() {
+        let (masks, borders) =
+            selection_visual_rects((100.0, 50.0), (500.0, 250.0), PixelSize { width: 1000, height: 500 }).unwrap();
+        assert_eq!(
+            masks,
+            [
+                RectI { x: 0, y: 0, width: 1000, height: 50 },
+                RectI { x: 0, y: 250, width: 1000, height: 250 },
+                RectI { x: 0, y: 50, width: 100, height: 200 },
+                RectI { x: 500, y: 50, width: 500, height: 200 },
+            ]
+        );
+        assert_eq!(
+            borders,
+            [
+                RectI { x: 100, y: 50, width: 400, height: 2 },
+                RectI { x: 100, y: 248, width: 400, height: 2 },
+                RectI { x: 100, y: 50, width: 2, height: 200 },
+                RectI { x: 498, y: 50, width: 2, height: 200 },
+            ]
+        );
+        assert_eq!(
+            selection_visual_rects((500.0, 250.0), (100.0, 50.0), PixelSize { width: 1000, height: 500 },),
+            Some((masks, borders))
+        );
+    }
+
+    #[test]
+    fn selection_visuals_reject_empty_drag() {
+        assert_eq!(selection_visual_rects((100.0, 50.0), (100.0, 50.0), PixelSize { width: 1000, height: 500 },), None);
     }
 }

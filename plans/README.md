@@ -27,8 +27,8 @@
 
 ## S2：静态覆盖层与选区
 
-- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能将 `CaptureFrame` 作为冻结 XRGB SHM buffer 显示到 layer-shell，鼠标左键拖拽返回原始像素 `PixelRect`，Esc 返回取消；仍待接入桌面 UI，并补动态遮罩/选框视觉。）
-- [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。（已完成独立 `zwlr_layer_shell_v1` 生命周期及冻结帧 runtime；使用 `wp_viewporter` 处理物理像素与 surface-local 尺寸差异，绑定 seat/pointer/keyboard，并保持无 Portal。下一步接 UI launcher 与动态选区渲染。）
+- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能将 `CaptureFrame` 作为冻结 XRGB SHM buffer 显示到 layer-shell，鼠标左键拖拽返回原始像素 `PixelRect`，Esc 返回取消；拖动时使用无输入区域的 subsurface 实时绘制半透明外部遮罩和白色边框。仍待接入桌面 UI 与宿主真机验收。）
+- [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。（已完成独立 `zwlr_layer_shell_v1` 生命周期及冻结帧 runtime；使用 `wp_viewporter` 处理物理像素与 surface-local 尺寸差异，并用 `wl_subcompositor` 的 desync 子 surface 绘制动态遮罩/边框，绑定 seat/pointer/keyboard，全程无 Portal。下一步接 UI launcher 与宿主真机验证。）
 - [ ] 原图裁剪、尺寸提示与选区边界测试。（预览选区使用归一化坐标并复用 `selection_to_pixels` 映射到原始像素，已覆盖反向拖拽、越界裁剪和尺寸提示；`Preview crop` 直接调用 `RgbaImage::crop` 生成原始分辨率裁剪图并显示预览。全屏 overlay 上的选区裁剪仍待接入。）
 
 ## S3：基础截图工具
