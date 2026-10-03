@@ -362,9 +362,7 @@ fn capture_with_probe(
     match probe.preferred_capture_protocol() {
         Some(WaylandCaptureProtocol::ExtImageCopyCapture) => match ext_capture() {
             Ok(frames) => Ok(frames),
-            Err(CaptureError::Unsupported(_) | CaptureError::InvalidFrame(_)) if probe.wlr_screencopy_manager_bound => {
-                wlr_capture()
-            }
+            Err(error) if probe.wlr_screencopy_manager_bound && ext_error_allows_wlr_fallback(&error) => wlr_capture(),
             Err(error) => Err(error),
         },
         Some(WaylandCaptureProtocol::WlrScreencopy) => wlr_capture(),
@@ -372,6 +370,16 @@ fn capture_with_probe(
             "Wayland compositor advertises neither ext-image-copy-capture nor wlr-screencopy".into(),
         )),
     }
+}
+
+fn ext_error_allows_wlr_fallback(error: &CaptureError) -> bool {
+    matches!(
+        error,
+        CaptureError::Unsupported(_)
+            | CaptureError::InvalidFrame(_)
+            | CaptureError::BackendFailure(_)
+            | CaptureError::Timeout
+    )
 }
 
 pub fn capture_ext(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
@@ -506,6 +514,20 @@ mod tests {
     fn falls_back_to_wlr_screencopy() {
         assert_eq!(select_capture_protocol(false, false, true), Some(WaylandCaptureProtocol::WlrScreencopy));
         assert_eq!(select_capture_protocol(false, false, false), None);
+    }
+
+    #[test]
+    fn runtime_ext_failures_fall_back_without_overriding_cancel_or_permission() {
+        for error in [
+            CaptureError::Unsupported("missing".into()),
+            CaptureError::InvalidFrame("bad frame".into()),
+            CaptureError::BackendFailure("failed".into()),
+            CaptureError::Timeout,
+        ] {
+            assert!(ext_error_allows_wlr_fallback(&error), "{error}");
+        }
+        assert!(!ext_error_allows_wlr_fallback(&CaptureError::Cancelled));
+        assert!(!ext_error_allows_wlr_fallback(&CaptureError::PermissionDenied("denied".into())));
     }
 
     #[test]
