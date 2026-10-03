@@ -829,13 +829,21 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
         _queue_handle: &QueueHandle<Self>,
     ) {
         match event {
-            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } if width > 0 && height > 0 => {
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
                 begin_constraint_batch(state);
-                state.constraint_size = Some(PixelSize { width, height });
+                if width > 0 && height > 0 {
+                    state.constraint_size = Some(PixelSize { width, height });
+                }
             }
-            ext_image_copy_capture_session_v1::Event::ShmFormat { format: WEnum::Value(format) } => {
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
                 begin_constraint_batch(state);
-                state.shm_formats.push(format);
+                if let WEnum::Value(format) = format {
+                    state.shm_formats.push(format);
+                }
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { .. }
+            | ext_image_copy_capture_session_v1::Event::DmabufFormat { .. } => {
+                begin_constraint_batch(state);
             }
             ext_image_copy_capture_session_v1::Event::Done => {
                 state.constraints_done = true;
