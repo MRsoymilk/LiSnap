@@ -285,6 +285,7 @@ pub(crate) fn run_connection(
         .shm
         .clone()
         .ok_or_else(|| CaptureError::Unsupported("wl_shm is not advertised by this compositor".into()))?;
+    require_input_capabilities(state.pointer.is_some(), state.keyboard.is_some())?;
     let output = select_output(&state, &frame.screen.id)?.proxy.clone();
 
     let surface = compositor.create_surface(&queue_handle, ());
@@ -420,6 +421,21 @@ fn run_input_loop(
         event_queue
             .blocking_dispatch(state)
             .map_err(|error| CaptureError::BackendFailure(format!("Wayland overlay input dispatch failed: {error}")))?;
+    }
+}
+
+fn require_input_capabilities(pointer: bool, keyboard: bool) -> Result<(), CaptureError> {
+    match (pointer, keyboard) {
+        (true, true) => Ok(()),
+        (false, false) => Err(CaptureError::Unsupported(
+            "Wayland selection overlay requires pointer and keyboard seat capabilities".into(),
+        )),
+        (false, true) => {
+            Err(CaptureError::Unsupported("Wayland selection overlay requires a pointer seat capability".into()))
+        }
+        (true, false) => Err(CaptureError::Unsupported(
+            "Wayland selection overlay requires a keyboard seat capability for Esc cancellation".into(),
+        )),
     }
 }
 
@@ -904,5 +920,13 @@ mod tests {
     #[test]
     fn selection_visuals_reject_empty_drag() {
         assert_eq!(selection_visual_rects((100.0, 50.0), (100.0, 50.0), PixelSize { width: 1000, height: 500 },), None);
+    }
+
+    #[test]
+    fn overlay_requires_pointer_and_keyboard_capabilities() {
+        assert!(require_input_capabilities(true, true).is_ok());
+        assert!(matches!(require_input_capabilities(false, true), Err(CaptureError::Unsupported(_))));
+        assert!(matches!(require_input_capabilities(true, false), Err(CaptureError::Unsupported(_))));
+        assert!(matches!(require_input_capabilities(false, false), Err(CaptureError::Unsupported(_))));
     }
 }
