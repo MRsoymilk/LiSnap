@@ -53,6 +53,7 @@ struct ExtState {
     constraint_size: Option<PixelSize>,
     shm_formats: Vec<wl_shm::Format>,
     constraints_done: bool,
+    constraint_generation: u64,
     session_stopped: bool,
     shm: Option<wl_shm::WlShm>,
     frame_state: Option<FrameState>,
@@ -65,11 +66,18 @@ struct OutputData {
     global_name: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameFailure {
+    Unknown,
+    BufferConstraints,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameState {
     Waiting,
     Ready,
-    Failed(String),
+    Failed(FrameFailure),
 }
 
 pub(crate) fn negotiate_connection(
@@ -211,78 +219,33 @@ pub(crate) fn capture_connection(
             ext_image_copy_capture_manager_v1::Options::empty()
         };
         let session = capture_manager.create_session(&source, options, &queue_handle, ());
-        let deadline = Instant::now() + NEGOTIATION_TIMEOUT;
         let capture_result = (|| -> Result<CaptureFrame, CaptureError> {
-            wait_for_constraints(&mut event_queue, &mut state, request, deadline)?;
-            let size = state.constraint_size.ok_or_else(|| {
-                CaptureError::InvalidFrame("ext-image-copy-capture did not advertise a buffer size".into())
-            })?;
-            let format = select_shm_format(&state.shm_formats)?;
-            let stride = size
-                .width
-                .checked_mul(4)
-                .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture row size overflow".into()))?;
-            let byte_len = (stride as usize)
-                .checked_mul(size.height as usize)
-                .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture buffer size overflow".into()))?;
-            let size_i32 = i32::try_from(byte_len).map_err(|_| {
-                CaptureError::InvalidFrame("ext-image-copy-capture buffer exceeds protocol size".into())
-            })?;
-            let width_i32 = i32::try_from(size.width).map_err(|_| {
-                CaptureError::InvalidFrame("ext-image-copy-capture width exceeds protocol range".into())
-            })?;
-            let height_i32 = i32::try_from(size.height).map_err(|_| {
-                CaptureError::InvalidFrame("ext-image-copy-capture height exceeds protocol range".into())
-            })?;
-            let stride_i32 = i32::try_from(stride).map_err(|_| {
-                CaptureError::InvalidFrame("ext-image-copy-capture stride exceeds protocol range".into())
-            })?;
-
-            let name = CString::new("lisnap-ext-capture")
-                .map_err(|_| CaptureError::BackendFailure("invalid memfd name".into()))?;
-            let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
-                .map_err(|error| CaptureError::BackendFailure(format!("memfd_create failed: {error}")))?;
-            let mut file = File::from(fd);
-            file.set_len(byte_len as u64)
-                .map_err(|error| CaptureError::BackendFailure(format!("resizing ext SHM buffer failed: {error}")))?;
-
-            let pool = shm.create_pool(file.as_fd(), size_i32, &queue_handle, ());
-            let buffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, format, &queue_handle, ());
-            pool.destroy();
-
-            state.frame_state = Some(FrameState::Waiting);
-            let frame = session.create_frame(&queue_handle, ());
-            let frame_result = (|| -> Result<CaptureFrame, CaptureError> {
-                frame.attach_buffer(&buffer);
-                frame.damage_buffer(0, 0, width_i32, height_i32);
-                frame.capture();
-                wait_for_frame(&mut event_queue, &mut state, request, Instant::now() + NEGOTIATION_TIMEOUT)?;
-
-                let mut native = vec![0_u8; byte_len];
-                file.seek(SeekFrom::Start(0))
-                    .map_err(|error| CaptureError::BackendFailure(format!("seeking ext SHM buffer failed: {error}")))?;
-                file.read_exact(&mut native)
-                    .map_err(|error| CaptureError::BackendFailure(format!("reading ext SHM buffer failed: {error}")))?;
-
-                let rgba = convert_shm_rgba(format, size, stride, &native)?;
-                let transform = state.frame_transform.unwrap_or(wl_output::Transform::Normal);
-                let (pixel_size, rgba) = normalize_transform(size, rgba, transform)?;
-                let image = RgbaImage::new(pixel_size, rgba)?;
-                Ok(CaptureFrame {
-                    screen: ScreenInfo {
-                        id: output_name.clone(),
-                        name: output_name.clone(),
-                        logical_geometry: None,
-                        pixel_size,
-                        scale_factor: None,
-                    },
-                    image,
-                    captured_at: SystemTime::now(),
-                })
-            })();
-            frame.destroy();
-            buffer.destroy();
-            frame_result
+            for attempt in 0..2 {
+                wait_for_constraints(&mut event_queue, &mut state, request, Instant::now() + NEGOTIATION_TIMEOUT)?;
+                let generation = state.constraint_generation;
+                match capture_frame_attempt(
+                    &session,
+                    &shm,
+                    &queue_handle,
+                    &mut event_queue,
+                    &mut state,
+                    request,
+                    &output_name,
+                )? {
+                    Some(frame) => return Ok(frame),
+                    None if attempt == 0 => {
+                        if state.constraint_generation == generation {
+                            state.constraints_done = false;
+                        }
+                    }
+                    None => {
+                        return Err(CaptureError::InvalidFrame(
+                            "ext-image-copy-capture buffer constraints changed repeatedly".into(),
+                        ));
+                    }
+                }
+            }
+            unreachable!("two ext-image-copy-capture attempts always return or error")
         })();
         session.destroy();
         source.destroy();
@@ -290,6 +253,101 @@ pub(crate) fn capture_connection(
     }
 
     Ok(frames)
+}
+
+fn capture_frame_attempt(
+    session: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
+    shm: &wl_shm::WlShm,
+    queue_handle: &QueueHandle<ExtState>,
+    event_queue: &mut wayland_client::EventQueue<ExtState>,
+    state: &mut ExtState,
+    request: &CaptureRequest,
+    output_name: &str,
+) -> Result<Option<CaptureFrame>, CaptureError> {
+    let size = state
+        .constraint_size
+        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture did not advertise a buffer size".into()))?;
+    let format = select_shm_format(&state.shm_formats)?;
+    let stride = size
+        .width
+        .checked_mul(4)
+        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture row size overflow".into()))?;
+    let byte_len = (stride as usize)
+        .checked_mul(size.height as usize)
+        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture buffer size overflow".into()))?;
+    let size_i32 = i32::try_from(byte_len)
+        .map_err(|_| CaptureError::InvalidFrame("ext-image-copy-capture buffer exceeds protocol size".into()))?;
+    let width_i32 = i32::try_from(size.width)
+        .map_err(|_| CaptureError::InvalidFrame("ext-image-copy-capture width exceeds protocol range".into()))?;
+    let height_i32 = i32::try_from(size.height)
+        .map_err(|_| CaptureError::InvalidFrame("ext-image-copy-capture height exceeds protocol range".into()))?;
+    let stride_i32 = i32::try_from(stride)
+        .map_err(|_| CaptureError::InvalidFrame("ext-image-copy-capture stride exceeds protocol range".into()))?;
+
+    let name =
+        CString::new("lisnap-ext-capture").map_err(|_| CaptureError::BackendFailure("invalid memfd name".into()))?;
+    let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+        .map_err(|error| CaptureError::BackendFailure(format!("memfd_create failed: {error}")))?;
+    let mut file = File::from(fd);
+    file.set_len(byte_len as u64)
+        .map_err(|error| CaptureError::BackendFailure(format!("resizing ext SHM buffer failed: {error}")))?;
+
+    let pool = shm.create_pool(file.as_fd(), size_i32, queue_handle, ());
+    let buffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, format, queue_handle, ());
+    pool.destroy();
+
+    state.frame_state = Some(FrameState::Waiting);
+    state.frame_transform = None;
+    let frame = session.create_frame(queue_handle, ());
+    let frame_result = (|| -> Result<Option<CaptureFrame>, CaptureError> {
+        frame.attach_buffer(&buffer);
+        frame.damage_buffer(0, 0, width_i32, height_i32);
+        frame.capture();
+        match wait_for_frame(event_queue, state, request, Instant::now() + NEGOTIATION_TIMEOUT)? {
+            FrameState::Failed(FrameFailure::BufferConstraints) => return Ok(None),
+            FrameState::Failed(FrameFailure::Stopped) => {
+                return Err(CaptureError::BackendFailure(
+                    "ext-image-copy-capture session stopped while copying".into(),
+                ));
+            }
+            FrameState::Failed(FrameFailure::Unknown) => {
+                return Err(CaptureError::BackendFailure(
+                    "ext-image-copy-capture compositor rejected the frame".into(),
+                ));
+            }
+            FrameState::Ready => {}
+            FrameState::Waiting => {
+                return Err(CaptureError::BackendFailure(
+                    "ext-image-copy-capture frame remained pending after wait".into(),
+                ));
+            }
+        }
+
+        let mut native = vec![0_u8; byte_len];
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| CaptureError::BackendFailure(format!("seeking ext SHM buffer failed: {error}")))?;
+        file.read_exact(&mut native)
+            .map_err(|error| CaptureError::BackendFailure(format!("reading ext SHM buffer failed: {error}")))?;
+
+        let rgba = convert_shm_rgba(format, size, stride, &native)?;
+        let transform = state.frame_transform.unwrap_or(wl_output::Transform::Normal);
+        let (pixel_size, rgba) = normalize_transform(size, rgba, transform)?;
+        let image = RgbaImage::new(pixel_size, rgba)?;
+        Ok(Some(CaptureFrame {
+            screen: ScreenInfo {
+                id: output_name.to_owned(),
+                name: output_name.to_owned(),
+                logical_geometry: None,
+                pixel_size,
+                scale_factor: None,
+            },
+            image,
+            captured_at: SystemTime::now(),
+        }))
+    })();
+    frame.destroy();
+    buffer.destroy();
+    frame_result
 }
 
 fn select_shm_format(formats: &[wl_shm::Format]) -> Result<wl_shm::Format, CaptureError> {
@@ -307,18 +365,14 @@ fn wait_for_frame(
     state: &mut ExtState,
     request: &CaptureRequest,
     deadline: Instant,
-) -> Result<(), CaptureError> {
+) -> Result<FrameState, CaptureError> {
     loop {
         if state.session_stopped {
-            return Err(CaptureError::BackendFailure("ext-image-copy-capture session stopped while copying".into()));
+            return Ok(FrameState::Failed(FrameFailure::Stopped));
         }
-        match state.frame_state.as_ref() {
-            Some(FrameState::Ready) => return Ok(()),
-            Some(FrameState::Failed(reason)) => {
-                return Err(CaptureError::BackendFailure(format!(
-                    "ext-image-copy-capture compositor rejected the frame: {reason}"
-                )));
-            }
+        match state.frame_state {
+            Some(FrameState::Ready) => return Ok(FrameState::Ready),
+            Some(FrameState::Failed(reason)) => return Ok(FrameState::Failed(reason)),
             _ => dispatch_with_deadline(event_queue, state, request, deadline, "ext-image-copy-capture frame copy")?,
         }
     }
@@ -449,6 +503,14 @@ fn bounded_roundtrip(
         dispatch_with_deadline(event_queue, state, request, deadline, context)?;
     }
     Ok(())
+}
+
+fn begin_constraint_batch(state: &mut ExtState) {
+    if state.constraints_done {
+        state.constraints_done = false;
+        state.constraint_size = None;
+        state.shm_formats.clear();
+    }
 }
 
 fn wait_for_constraints(
@@ -689,7 +751,14 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
                 state.frame_state = Some(FrameState::Ready);
             }
             ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
-                state.frame_state = Some(FrameState::Failed(format!("{reason:?}")));
+                let failure = match reason {
+                    WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints) => {
+                        FrameFailure::BufferConstraints
+                    }
+                    WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::Stopped) => FrameFailure::Stopped,
+                    _ => FrameFailure::Unknown,
+                };
+                state.frame_state = Some(FrameState::Failed(failure));
             }
             _ => {}
         }
@@ -707,13 +776,16 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
     ) {
         match event {
             ext_image_copy_capture_session_v1::Event::BufferSize { width, height } if width > 0 && height > 0 => {
+                begin_constraint_batch(state);
                 state.constraint_size = Some(PixelSize { width, height });
             }
             ext_image_copy_capture_session_v1::Event::ShmFormat { format: WEnum::Value(format) } => {
+                begin_constraint_batch(state);
                 state.shm_formats.push(format);
             }
             ext_image_copy_capture_session_v1::Event::Done => {
                 state.constraints_done = true;
+                state.constraint_generation = state.constraint_generation.saturating_add(1);
             }
             ext_image_copy_capture_session_v1::Event::Stopped => {
                 state.session_stopped = true;
@@ -772,6 +844,22 @@ mod tests {
             assert_eq!(actual_size, expected_size, "{transform:?}");
             assert_eq!(red_channel(&transformed), expected_red, "{transform:?}");
         }
+    }
+
+    #[test]
+    fn starts_fresh_constraint_batch_after_done() {
+        let mut state = ExtState {
+            constraint_size: Some(PixelSize { width: 1920, height: 1080 }),
+            shm_formats: vec![wl_shm::Format::Argb8888],
+            constraints_done: true,
+            constraint_generation: 1,
+            ..ExtState::default()
+        };
+        begin_constraint_batch(&mut state);
+        assert!(!state.constraints_done);
+        assert_eq!(state.constraint_size, None);
+        assert!(state.shm_formats.is_empty());
+        assert_eq!(state.constraint_generation, 1);
     }
 
     #[test]
