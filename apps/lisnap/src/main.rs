@@ -65,10 +65,11 @@ fn print_wayland_probe(socket: Option<&str>) -> Result<(), String> {
     println!("Wayland outputs: {}", probe.outputs.len());
     for output in &probe.outputs {
         println!(
-            "output {} | {} | wl_output v{} | scale {}",
+            "output {} | {} | wl_output v{} | pixels {} | scale {}",
             output.global_name,
             output.name.as_deref().unwrap_or("<unnamed>"),
             output.protocol_version,
+            output.pixel_size.map_or_else(|| "unknown".into(), |size| format!("{}x{}", size.width, size.height)),
             output.scale_factor.map_or_else(|| "unknown".into(), |scale| scale.to_string())
         );
         if let Some(description) = output.description.as_deref() {
@@ -139,6 +140,15 @@ fn run_wayland_capture(cli: &Cli) -> Result<(), String> {
         include_cursor: cli.include_cursor,
         cancellation: None,
     };
+    let probe = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::probe_wayland_socket(std::path::Path::new(path)),
+        None => lisnap_platform::probe_wayland(),
+    }
+    .map_err(|error| error.to_string())?;
+    println!(
+        "Wayland capture protocol: {}",
+        probe.preferred_capture_protocol().map_or_else(|| "none".into(), |protocol| protocol.to_string())
+    );
     let frames = match cli.wayland_socket.as_deref() {
         Some(path) => lisnap_platform::capture_wayland_socket(std::path::Path::new(path), &request),
         None => lisnap_platform::capture_wayland(&request),
@@ -176,10 +186,12 @@ fn print_capture_frames(label: &str, frames: Vec<lisnap_core::CaptureFrame>) -> 
         let size = frame.image.size();
         let pixels = frame.image.pixels();
         println!(
-            "{} | {}x{} | {} RGBA bytes | fnv64 {:016x}",
+            "{} | {} | {}x{} | scale {} | {} RGBA bytes | fnv64 {:016x}",
             frame.screen.id,
+            frame.screen.name,
             size.width,
             size.height,
+            frame.screen.scale_factor.map_or_else(|| "unknown".into(), |scale| scale.to_string()),
             pixels.len(),
             fnv1a64(pixels)
         );
