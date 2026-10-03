@@ -177,6 +177,13 @@ impl LiSnapApp {
         }
     }
 
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.preview_selection = None;
+        self.crop_texture = None;
+        self.crop_size = None;
+    }
+
     fn poll_capture(&mut self, context: &egui::Context) {
         let Some(result) = self.active_capture.as_ref().map(|active| active.receiver.try_recv()) else {
             return;
@@ -251,10 +258,7 @@ impl LiSnapApp {
             self.preview_selection = normalized_selection(rect, anchor, pointer);
         }
         if response.double_clicked() {
-            self.selection_anchor = None;
-            self.preview_selection = None;
-            self.crop_texture = None;
-            self.crop_size = None;
+            self.clear_selection();
         }
 
         if let Some(selection) = self.preview_selection {
@@ -433,6 +437,9 @@ impl LiSnapApp {
 
 impl eframe::App for LiSnapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) && self.active_capture.is_none() {
+            self.clear_selection();
+        }
         if !self.screens_requested && self.screen_launcher.is_some() {
             self.refresh_screens();
         }
@@ -609,5 +616,20 @@ mod tests {
 
         assert_eq!(app.crop_size, Some(PixelSize { width: 2, height: 2 }));
         assert!(app.crop_texture.is_some());
+    }
+
+    #[test]
+    fn clear_selection_removes_crop_state() {
+        let mut app = LiSnapApp::new(None, Vec::new(), None, None);
+        app.selection_anchor = Some(egui::pos2(10.0, 20.0));
+        app.preview_selection = Some(egui::Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.5, 0.6)));
+        app.crop_size = Some(PixelSize { width: 100, height: 80 });
+
+        app.clear_selection();
+
+        assert!(app.selection_anchor.is_none());
+        assert!(app.preview_selection.is_none());
+        assert!(app.crop_texture.is_none());
+        assert!(app.crop_size.is_none());
     }
 }
