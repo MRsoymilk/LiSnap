@@ -27,9 +27,9 @@
 
 ## S2：静态覆盖层与选区
 
-- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能显示冻结帧、动态遮罩/白色边框、鼠标拖拽和 Esc 取消；`lisnap-ui` 已新增异步 Overlay launcher，`Select region` 可消费返回的 `PixelRect` 并自动生成原图裁剪预览。仍待应用组合层注入真实 Wayland launcher 与宿主真机验收。）
+- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能显示冻结帧、动态遮罩/白色边框、鼠标拖拽和 Esc 取消；`lisnap-ui` 已新增异步 Overlay launcher，`Select region` 可消费返回的 `PixelRect` 并自动生成原图裁剪预览。另有 `scripts/validate-wayland-overlay.sh` 可绕过主程序直接做宿主捕获→冻结→拖选→裁剪验收；仍待真实 Hyprland 执行。）
 - [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。（平台 runtime 与 UI launcher 接口均已完成；`run_with_overlay()` 保持原 `run()` 兼容，等待 `apps/lisnap` 注入 `run_wayland_frozen_overlay` worker。之后进行宿主 Hyprland 真机验证，再扩展多输出与跨屏选区。）
-- [ ] 原图裁剪、尺寸提示与选区边界测试。（预览选区使用归一化坐标并复用 `selection_to_pixels` 映射到原始像素，已覆盖反向拖拽、越界裁剪和尺寸提示；`Preview crop` 直接调用 `RgbaImage::crop` 生成原始分辨率裁剪图并显示预览。全屏 overlay 上的选区裁剪仍待接入。）
+- [ ] 原图裁剪、尺寸提示与选区边界测试。（预览和全屏 Overlay 均使用 `selection_to_pixels` 映射到原始像素；`Preview crop` 直接调用 `RgbaImage::crop`，独立 `wayland-overlay` example 也会对 Overlay 返回的 `PixelRect` 裁原图并输出 RGBA 字节数/FNV64。宿主真机结果仍待验收。）
 
 ## S3：基础截图工具
 
