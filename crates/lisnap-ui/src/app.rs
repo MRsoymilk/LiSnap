@@ -59,6 +59,8 @@ pub(crate) struct LiSnapApp {
     preview_output: Option<String>,
     selection_anchor: Option<egui::Pos2>,
     preview_selection: Option<egui::Rect>,
+    crop_texture: Option<egui::TextureHandle>,
+    crop_size: Option<PixelSize>,
     capture_message: Option<String>,
 }
 
@@ -85,6 +87,8 @@ impl LiSnapApp {
             preview_output: None,
             selection_anchor: None,
             preview_selection: None,
+            crop_texture: None,
+            crop_size: None,
             capture_message: None,
         }
     }
@@ -160,6 +164,8 @@ impl LiSnapApp {
         self.preview_output = None;
         self.selection_anchor = None;
         self.preview_selection = None;
+        self.crop_texture = None;
+        self.crop_size = None;
         self.capture_message = Some("Capturing…".into());
         self.active_capture = Some(ActiveCapture { receiver: launcher(request), cancellation });
     }
@@ -236,6 +242,8 @@ impl LiSnapApp {
         if response.drag_started() {
             self.selection_anchor = response.interact_pointer_pos().map(|point| clamp_to_rect(point, rect));
             self.preview_selection = None;
+            self.crop_texture = None;
+            self.crop_size = None;
         }
         if response.dragged()
             && let (Some(anchor), Some(pointer)) = (self.selection_anchor, response.interact_pointer_pos())
@@ -245,6 +253,8 @@ impl LiSnapApp {
         if response.double_clicked() {
             self.selection_anchor = None;
             self.preview_selection = None;
+            self.crop_texture = None;
+            self.crop_size = None;
         }
 
         if let Some(selection) = self.preview_selection {
@@ -261,6 +271,19 @@ impl LiSnapApp {
             ui.painter().line_segment([max, egui::pos2(min.x, max.y)], stroke);
             ui.painter().line_segment([egui::pos2(min.x, max.y), min], stroke);
         }
+    }
+
+    fn build_crop_preview(&mut self, context: &egui::Context) -> Result<(), String> {
+        let selection = self.preview_selection.ok_or("no preview selection")?;
+        let frame = self.captured_frames.first().ok_or("no captured frame")?;
+        let rect = selection_pixels(selection, frame.image.size()).ok_or("selection has no pixels")?;
+        let cropped = frame.image.crop(rect).map_err(|error| error.to_string())?;
+        let size = cropped.size();
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([size.width as usize, size.height as usize], cropped.pixels());
+        self.crop_texture = Some(context.load_texture("crop-preview", image, egui::TextureOptions::LINEAR));
+        self.crop_size = Some(size);
+        Ok(())
     }
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
@@ -327,12 +350,23 @@ impl LiSnapApp {
                     && let Some(frame) = self.captured_frames.first()
                     && let Some(pixels) = selection_pixels(selection, frame.image.size())
                 {
-                    ui.small(format!(
-                        "Selection: {}x{} px at {},{} — double-click preview to clear",
-                        pixels.width, pixels.height, pixels.x, pixels.y
-                    ));
+                    ui.horizontal(|ui| {
+                        ui.small(format!(
+                            "Selection: {}x{} px at {},{} — double-click preview to clear",
+                            pixels.width, pixels.height, pixels.x, pixels.y
+                        ));
+                        if ui.button("Preview crop").clicked()
+                            && let Err(error) = self.build_crop_preview(ui.ctx())
+                        {
+                            self.capture_message = Some(format!("Crop failed: {error}"));
+                        }
+                    });
                 } else {
                     ui.small("Drag on the preview to create a crop selection.");
+                }
+                if let (Some(texture), Some(size)) = (&self.crop_texture, self.crop_size) {
+                    ui.small(format!("Crop preview: {}x{} px", size.width, size.height));
+                    ui.add(egui::Image::new(texture).max_width(ui.available_width()).max_height(240.0));
                 }
                 ui.add_space(6.0);
             }
@@ -543,5 +577,37 @@ mod tests {
         let selection = egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75));
         let pixels = selection_pixels(selection, PixelSize { width: 1920, height: 1080 }).unwrap();
         assert_eq!(pixels, PixelRect { x: 480, y: 270, width: 960, height: 540 });
+    }
+
+    #[test]
+    fn crop_preview_uses_original_pixels() {
+        let image = RgbaImage::new(
+            PixelSize { width: 4, height: 2 },
+            vec![
+                1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255, 7, 0, 0, 255, 8, 0,
+                0, 255,
+            ],
+        )
+        .unwrap();
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "display-1".into(),
+                name: "Display 1".into(),
+                logical_geometry: None,
+                pixel_size: image.size(),
+                scale_factor: Some(1.0),
+            },
+            image,
+            captured_at: SystemTime::now(),
+        };
+        let context = egui::Context::default();
+        let mut app = LiSnapApp::new(None, Vec::new(), None, None);
+        app.captured_frames = vec![frame];
+        app.preview_selection = Some(egui::Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0)));
+
+        app.build_crop_preview(&context).unwrap();
+
+        assert_eq!(app.crop_size, Some(PixelSize { width: 2, height: 2 }));
+        assert!(app.crop_texture.is_some());
     }
 }
