@@ -28,7 +28,7 @@
 ## S2：静态覆盖层与选区
 
 - [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（桌面捕获预览已支持拖动矩形选区、双击清除与 Esc 清除；真正全屏冻结/覆盖层中的 Esc 取消仍待实现。）
-- [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。
+- [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。（已新增独立 `zwlr_layer_shell_v1` 平台模块，完成目标输出选择、Overlay layer、四边 anchor、`exclusive_zone=-1`、独占键盘焦点、初始空 commit、configure/ack 与超时销毁生命周期；下一步接冻结帧 SHM buffer 与 pointer/keyboard 输入。）
 - [ ] 原图裁剪、尺寸提示与选区边界测试。（预览选区使用归一化坐标并复用 `selection_to_pixels` 映射到原始像素，已覆盖反向拖拽、越界裁剪和尺寸提示；`Preview crop` 直接调用 `RgbaImage::crop` 生成原始分辨率裁剪图并显示预览。全屏 overlay 上的选区裁剪仍待接入。）
 
 ## S3：基础截图工具

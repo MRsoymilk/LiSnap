@@ -1,5 +1,6 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
 mod ext;
+mod overlay;
 mod shm;
 mod wlr;
 
@@ -68,6 +69,13 @@ pub struct WaylandExtConstraints {
     pub output_id: String,
     pub pixel_size: PixelSize,
     pub shm_formats: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaylandOverlayLifecycle {
+    pub output_id: String,
+    pub configured_size: PixelSize,
+    pub layer_shell_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +369,27 @@ fn map_ext_constraints(
             shm_formats: constraint.shm_formats.into_iter().map(|format| format!("{format:?}")).collect(),
         })
         .collect())
+}
+
+pub fn validate_overlay_lifecycle(output_id: Option<&str>) -> Result<WaylandOverlayLifecycle, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    map_overlay_lifecycle(overlay::lifecycle_connection(connection, output_id)?)
+}
+
+pub fn validate_overlay_lifecycle_socket(
+    path: &Path,
+    output_id: Option<&str>,
+) -> Result<WaylandOverlayLifecycle, CaptureError> {
+    map_overlay_lifecycle(overlay::lifecycle_connection(connect_socket(path)?, output_id)?)
+}
+
+fn map_overlay_lifecycle(lifecycle: overlay::OverlayLifecycle) -> Result<WaylandOverlayLifecycle, CaptureError> {
+    Ok(WaylandOverlayLifecycle {
+        output_id: lifecycle.output_id,
+        configured_size: lifecycle.configured_size,
+        layer_shell_version: lifecycle.layer_shell_version,
+    })
 }
 
 pub fn capture_auto(request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError> {
