@@ -1,9 +1,9 @@
 use std::{sync::mpsc::TryRecvError, time::Duration};
 
 use eframe::egui;
-use lisnap_core::{BackendDescriptor, CaptureCancellation, CaptureFrame, CaptureRequest};
+use lisnap_core::{BackendDescriptor, CaptureCancellation, CaptureFrame, CaptureRequest, ScreenInfo};
 
-use crate::{CaptureLauncher, CaptureReceiver};
+use crate::{CaptureLauncher, CaptureReceiver, ScreenLauncher, ScreenReceiver};
 
 struct ActiveCapture {
     receiver: CaptureReceiver,
@@ -15,6 +15,11 @@ pub(crate) struct LiSnapApp {
     backends: Vec<BackendDescriptor>,
     request: CaptureRequest,
     capture_launcher: Option<CaptureLauncher>,
+    screen_launcher: Option<ScreenLauncher>,
+    screen_receiver: Option<ScreenReceiver>,
+    screens: Vec<ScreenInfo>,
+    screens_requested: bool,
+    screen_message: Option<String>,
     active_capture: Option<ActiveCapture>,
     captured_frames: Vec<CaptureFrame>,
     preview_texture: Option<egui::TextureHandle>,
@@ -27,17 +32,77 @@ impl LiSnapApp {
         selected: Option<BackendDescriptor>,
         backends: Vec<BackendDescriptor>,
         capture_launcher: Option<CaptureLauncher>,
+        screen_launcher: Option<ScreenLauncher>,
     ) -> Self {
         Self {
             selected,
             backends,
             request: CaptureRequest::default(),
             capture_launcher,
+            screen_launcher,
+            screen_receiver: None,
+            screens: Vec::new(),
+            screens_requested: false,
+            screen_message: None,
             active_capture: None,
             captured_frames: Vec::new(),
             preview_texture: None,
             preview_output: None,
             capture_message: None,
+        }
+    }
+
+    fn refresh_screens(&mut self) {
+        if self.screen_receiver.is_some() {
+            return;
+        }
+        let Some(launcher) = self.screen_launcher.as_ref() else {
+            self.screen_message = Some("Selected backend cannot enumerate outputs.".into());
+            return;
+        };
+        self.screens_requested = true;
+        self.screen_message = Some("Refreshing outputs…".into());
+        self.screen_receiver = Some(launcher());
+    }
+
+    fn poll_screens(&mut self, context: &egui::Context) {
+        let Some(result) = self.screen_receiver.as_ref().map(|receiver| receiver.try_recv()) else {
+            return;
+        };
+        match result {
+            Ok(Ok(screens)) => {
+                self.screen_receiver = None;
+                let count = screens.len();
+                if count == 0 {
+                    self.screens.clear();
+                    self.request.screen_id = None;
+                    self.screen_message = Some("Backend returned no outputs.".into());
+                    return;
+                }
+                if self
+                    .request
+                    .screen_id
+                    .as_ref()
+                    .is_some_and(|selected| !screens.iter().any(|screen| &screen.id == selected))
+                {
+                    self.request.screen_id = None;
+                }
+                self.screens = screens;
+                self.screen_message = Some(format!("Found {count} output(s)."));
+            }
+            Ok(Err(error)) => {
+                self.screen_receiver = None;
+                self.screens.clear();
+                self.request.screen_id = None;
+                self.screen_message = Some(format!("Output discovery failed: {error}"));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.screen_receiver = None;
+                self.screen_message = Some("Output discovery worker disconnected.".into());
+            }
+            Err(TryRecvError::Empty) => {
+                context.request_repaint_after(Duration::from_millis(50));
+            }
         }
     }
 
@@ -112,6 +177,37 @@ impl LiSnapApp {
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
         let busy = self.active_capture.is_some();
+        let screen_loading = self.screen_receiver.is_some();
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.screen_launcher.is_some() && !busy && !screen_loading,
+                    egui::Button::new("Refresh outputs"),
+                )
+                .clicked()
+            {
+                self.refresh_screens();
+            }
+            ui.add_enabled_ui(!busy, |ui| {
+                let selected_text = self
+                    .request
+                    .screen_id
+                    .as_ref()
+                    .and_then(|id| self.screens.iter().find(|screen| &screen.id == id))
+                    .map_or("All outputs", |screen| screen.name.as_str());
+                egui::ComboBox::from_id_salt("capture_output").selected_text(selected_text).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.request.screen_id, None, "All outputs");
+                    for screen in &self.screens {
+                        ui.selectable_value(&mut self.request.screen_id, Some(screen.id.clone()), &screen.name);
+                    }
+                });
+            });
+        });
+        if let Some(message) = &self.screen_message {
+            ui.small(message);
+        }
+
         ui.horizontal(|ui| {
             if ui.add_enabled(self.capture_launcher.is_some() && !busy, egui::Button::new("Capture screen")).clicked() {
                 self.start_capture();
@@ -203,6 +299,10 @@ impl LiSnapApp {
 
 impl eframe::App for LiSnapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.screens_requested && self.screen_launcher.is_some() {
+            self.refresh_screens();
+        }
+        self.poll_screens(ui.ctx());
         self.poll_capture(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.overview(ui));
@@ -224,7 +324,7 @@ mod tests {
     #[test]
     fn overview_renders_without_native_window() {
         let context = egui::Context::default();
-        let mut app = LiSnapApp::new(None, Vec::new(), None);
+        let mut app = LiSnapApp::new(None, Vec::new(), None, None);
 
         let mut output = context.run_ui(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| app.overview(ui));
@@ -235,13 +335,40 @@ mod tests {
     }
 
     #[test]
+    fn screen_worker_populates_outputs_and_resets_missing_selection() {
+        let launcher: ScreenLauncher = Arc::new(|| {
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(Ok(vec![ScreenInfo {
+                    id: "DP-1".into(),
+                    name: "External display".into(),
+                    logical_geometry: None,
+                    pixel_size: PixelSize { width: 2560, height: 1440 },
+                    scale_factor: Some(1.0),
+                }]))
+                .unwrap();
+            receiver
+        });
+        let mut app = LiSnapApp::new(None, Vec::new(), None, Some(launcher));
+        app.request.screen_id = Some("missing-output".into());
+        app.refresh_screens();
+
+        app.poll_screens(&egui::Context::default());
+
+        assert_eq!(app.screens.len(), 1);
+        assert_eq!(app.screens[0].id, "DP-1");
+        assert_eq!(app.request.screen_id, None);
+        assert_eq!(app.screen_message.as_deref(), Some("Found 1 output(s)."));
+    }
+
+    #[test]
     fn capture_worker_error_returns_to_idle_state() {
         let launcher: CaptureLauncher = Arc::new(|_request| {
             let (sender, receiver) = mpsc::channel();
             sender.send(Err("synthetic failure".into())).unwrap();
             receiver
         });
-        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher));
+        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher), None);
         app.start_capture();
         assert!(app.active_capture.is_some());
 
@@ -270,7 +397,7 @@ mod tests {
             receiver
         });
         let context = egui::Context::default();
-        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher));
+        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher), None);
         app.start_capture();
 
         app.poll_capture(&context);
@@ -290,7 +417,7 @@ mod tests {
             let (_sender, receiver) = mpsc::channel();
             receiver
         });
-        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher));
+        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher), None);
         app.start_capture();
         let request = request_receiver.recv().unwrap();
         assert!(!request.is_cancelled());

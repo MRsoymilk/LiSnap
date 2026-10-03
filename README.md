@@ -79,10 +79,10 @@ LISNAP_WAYLAND_SOCKET=/run/user/1000/wayland-1 sh scripts/validate-wayland.sh
 
 ### 当前验证结果
 
-在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试、`cargo clippy --workspace --all-targets -- -D warnings` 以及 GUI 启动验证均已通过。Wayland 代码现已覆盖 registry/output 枚举、ext/wlr manager 绑定、SHM 单帧复制、ARGB/XRGB 转换、stride、Y-invert/transform、cursor option、5 秒超时和取消；桌面窗口的 Capture 按钮也已通过后台 worker 接入 native backend，Cancel 使用同一个 `CaptureCancellation`。当前自动化执行环境的 bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实桌面像素仍必须通过 `scripts/validate-wayland.sh` 在宿主 Wayland 会话中完成最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后验收。
+在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试、`cargo clippy --workspace --all-targets -- -D warnings` 以及 GUI 启动验证均已通过。Wayland 代码现已覆盖 registry/output 枚举、ext/wlr manager 绑定、SHM 单帧复制、ARGB/XRGB 转换、stride、Y-invert/transform、cursor option、5 秒超时和取消；桌面窗口通过独立 worker 自动枚举输出，可选择单个输出或全部输出，Capture/Cancel 已接入 native backend，并能把首帧 RGBA 数据显示为静态 egui texture 预览。当前自动化执行环境的 bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实桌面像素仍必须通过 `scripts/validate-wayland.sh` 在宿主 Wayland 会话中完成最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后验收。
 
 ## 当前范围
 
-已实现 workspace、CLI、桌面窗口、后台 Capture/Cancel worker、平台接口、Linux/Wayland 原生单帧捕获、只读像素数据、裁剪、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 捕获仍未实现；全屏冻结覆盖层、鼠标框选交互、标注、PNG 导出、剪贴板、全局快捷键和托盘也仍待开发。
+已实现 workspace、CLI、桌面窗口、后台输出枚举与 Capture/Cancel worker、输出选择、首帧静态预览、平台接口、Linux/Wayland 原生单帧捕获、只读像素数据、裁剪、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 捕获仍未实现；全屏冻结覆盖层、鼠标框选交互、标注、PNG 导出、剪贴板、全局快捷键和托盘也仍待开发。
 
 下一步先完成 **Wayland 真机像素验收**，确认实际 compositor 输出可读且不包含自身选择 UI；之后进入静态覆盖层与选区阶段。不要将普通桌面窗口当成已实现的跨平台截屏 Overlay。

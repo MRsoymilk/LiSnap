@@ -221,14 +221,14 @@ fn launch_gui(kind: Option<BackendKind>) -> Result<(), String> {
         .transpose()
         .map_err(|error| error.to_string())?
         .map(|backend| backend.descriptor());
-    let capture_launcher = match (kind, selected) {
+    let (capture_launcher, screen_launcher) = match (kind, selected) {
         (Some(kind), Some(descriptor)) if descriptor.status == lisnap_core::BackendStatus::Available => {
-            Some(make_capture_launcher(kind))
+            (Some(make_capture_launcher(kind)), Some(make_screen_launcher(kind)))
         }
-        _ => None,
+        _ => (None, None),
     };
     let backends = BackendKind::ALL.into_iter().map(BackendKind::descriptor).collect();
-    lisnap_ui::run(selected, backends, capture_launcher).map_err(|error| error.to_string())
+    lisnap_ui::run(selected, backends, capture_launcher, screen_launcher).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "gui")]
@@ -238,6 +238,20 @@ fn make_capture_launcher(kind: BackendKind) -> lisnap_ui::CaptureLauncher {
         std::thread::spawn(move || {
             let result = lisnap_platform::create_backend(kind)
                 .and_then(|mut backend| backend.capture(&request))
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        receiver
+    })
+}
+
+#[cfg(feature = "gui")]
+fn make_screen_launcher(kind: BackendKind) -> lisnap_ui::ScreenLauncher {
+    std::sync::Arc::new(move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = lisnap_platform::create_backend(kind)
+                .and_then(|mut backend| backend.screens())
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);
         });

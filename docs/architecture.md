@@ -31,7 +31,7 @@ apps/lisnap ──→ lisnap-platform ──→ lisnap-core
 
 先完成所有目标输出的捕获，再显示选区覆盖层，避免把自身 UI 截进去。接着在静态图像上交互，确认后从原始像素裁剪，再合成用户主动添加的标注。关闭/取消时释放连接、帧和覆盖层资源。
 
-实际捕获不得阻塞 UI 重绘回调。原生 API 的线程约束由对应后端或服务层负责；当前 trait 不强制 `Send`，不提前假定 macOS、Wayland 与 Windows 的线程模型相同。桌面壳层通过 `CaptureLauncher` 启动后台 worker，并在线程内部创建 native backend，因此不跨线程移动后端对象；UI 通过 channel 轮询结果、显示忙碌/错误/帧摘要，并用 `CaptureCancellation` 协作取消 Wayland 等待。
+实际捕获不得阻塞 UI 重绘回调。原生 API 的线程约束由对应后端或服务层负责；当前 trait 不强制 `Send`，不提前假定 macOS、Wayland 与 Windows 的线程模型相同。桌面壳层通过 `CaptureLauncher` / `ScreenLauncher` 启动后台 worker，并在线程内部创建 native backend，因此不跨线程移动后端对象；UI 通过 channel 轮询输出枚举与捕获结果，可选择稳定 `screen_id`、显示忙碌/错误/帧摘要和首帧静态 texture，并用 `CaptureCancellation` 协作取消 Wayland 等待。
 
 ## 原生后端开发顺序
 
