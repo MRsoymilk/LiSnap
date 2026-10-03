@@ -424,39 +424,7 @@ fn convert_shm_rgba(
     stride: u32,
     native: &[u8],
 ) -> Result<Vec<u8>, CaptureError> {
-    let needed = (stride as usize)
-        .checked_mul(size.height as usize)
-        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture byte length overflow".into()))?;
-    if native.len() < needed {
-        return Err(CaptureError::InvalidFrame("ext-image-copy-capture SHM data is shorter than its stride".into()));
-    }
-    let row_bytes = (size.width as usize)
-        .checked_mul(4)
-        .ok_or_else(|| CaptureError::InvalidFrame("ext-image-copy-capture row size overflow".into()))?;
-    if (stride as usize) < row_bytes {
-        return Err(CaptureError::InvalidFrame("ext-image-copy-capture stride is shorter than one row".into()));
-    }
-    let mut rgba = vec![0_u8; row_bytes * size.height as usize];
-    for y in 0..size.height as usize {
-        let src = &native[y * stride as usize..y * stride as usize + row_bytes];
-        let dst = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
-        for (source, target) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-            let alpha = if format == wl_shm::Format::Argb8888 { source[3] } else { 255 };
-            let (red, green, blue) = if alpha == 0 {
-                (0, 0, 0)
-            } else if alpha < 255 && format == wl_shm::Format::Argb8888 {
-                (unpremultiply(source[2], alpha), unpremultiply(source[1], alpha), unpremultiply(source[0], alpha))
-            } else {
-                (source[2], source[1], source[0])
-            };
-            target.copy_from_slice(&[red, green, blue, alpha]);
-        }
-    }
-    Ok(rgba)
-}
-
-fn unpremultiply(channel: u8, alpha: u8) -> u8 {
-    ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+    super::shm::convert_rgba(format, size, stride, native, false)
 }
 
 fn normalize_transform(

@@ -1,5 +1,6 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
 mod ext;
+mod shm;
 mod wlr;
 
 use std::{collections::BTreeMap, os::unix::net::UnixStream, path::Path};

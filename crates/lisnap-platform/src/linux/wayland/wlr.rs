@@ -336,36 +336,13 @@ fn validate_spec(spec: BufferSpec) -> Result<(), CaptureError> {
 }
 
 fn convert_shm_rgba(spec: BufferSpec, native: &[u8], y_invert: bool) -> Result<Vec<u8>, CaptureError> {
-    let needed = (spec.stride as usize)
-        .checked_mul(spec.height as usize)
-        .ok_or_else(|| CaptureError::InvalidFrame("wlr-screencopy byte length overflow".into()))?;
-    if native.len() < needed {
-        return Err(CaptureError::InvalidFrame("wlr-screencopy SHM data is shorter than its stride".into()));
-    }
-
-    let row_bytes = spec.width as usize * 4;
-    let mut rgba = vec![0_u8; row_bytes * spec.height as usize];
-    for dst_y in 0..spec.height as usize {
-        let src_y = if y_invert { spec.height as usize - 1 - dst_y } else { dst_y };
-        let src = &native[src_y * spec.stride as usize..src_y * spec.stride as usize + row_bytes];
-        let dst = &mut rgba[dst_y * row_bytes..(dst_y + 1) * row_bytes];
-        for (source, target) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-            let alpha = if spec.format == wl_shm::Format::Argb8888 { source[3] } else { 255 };
-            let (red, green, blue) = if alpha == 0 {
-                (0, 0, 0)
-            } else if alpha < 255 && spec.format == wl_shm::Format::Argb8888 {
-                (unpremultiply(source[2], alpha), unpremultiply(source[1], alpha), unpremultiply(source[0], alpha))
-            } else {
-                (source[2], source[1], source[0])
-            };
-            target.copy_from_slice(&[red, green, blue, alpha]);
-        }
-    }
-    Ok(rgba)
-}
-
-fn unpremultiply(channel: u8, alpha: u8) -> u8 {
-    ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+    super::shm::convert_rgba(
+        spec.format,
+        PixelSize { width: spec.width, height: spec.height },
+        spec.stride,
+        native,
+        y_invert,
+    )
 }
 
 impl Dispatch<wl_callback::WlCallback, ()> for CaptureState {
