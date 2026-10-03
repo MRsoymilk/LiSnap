@@ -1,5 +1,6 @@
 //! Native desktop shell. Full-screen capture overlays are a separate future platform surface.
 mod app;
+mod selection;
 
 use std::sync::{Arc, mpsc};
 
