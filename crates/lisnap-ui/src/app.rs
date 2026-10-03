@@ -17,6 +17,8 @@ pub(crate) struct LiSnapApp {
     capture_launcher: Option<CaptureLauncher>,
     active_capture: Option<ActiveCapture>,
     captured_frames: Vec<CaptureFrame>,
+    preview_texture: Option<egui::TextureHandle>,
+    preview_output: Option<String>,
     capture_message: Option<String>,
 }
 
@@ -33,6 +35,8 @@ impl LiSnapApp {
             capture_launcher,
             active_capture: None,
             captured_frames: Vec::new(),
+            preview_texture: None,
+            preview_output: None,
             capture_message: None,
         }
     }
@@ -50,6 +54,8 @@ impl LiSnapApp {
         let mut request = self.request.clone();
         request.cancellation = Some(cancellation.clone());
         self.captured_frames.clear();
+        self.preview_texture = None;
+        self.preview_output = None;
         self.capture_message = Some("Capturing…".into());
         self.active_capture = Some(ActiveCapture { receiver: launcher(request), cancellation });
     }
@@ -72,6 +78,7 @@ impl LiSnapApp {
                     self.capture_message = Some("Capture failed: backend returned no frames.".into());
                 } else {
                     let count = frames.len();
+                    self.update_preview(context, &frames);
                     self.captured_frames = frames;
                     self.capture_message = Some(format!("Captured {count} output(s)."));
                 }
@@ -88,6 +95,19 @@ impl LiSnapApp {
                 context.request_repaint_after(Duration::from_millis(50));
             }
         }
+    }
+
+    fn update_preview(&mut self, context: &egui::Context, frames: &[CaptureFrame]) {
+        let Some(frame) = frames.first() else {
+            self.preview_texture = None;
+            self.preview_output = None;
+            return;
+        };
+        let size = frame.image.size();
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([size.width as usize, size.height as usize], frame.image.pixels());
+        self.preview_texture = Some(context.load_texture("capture-preview", image, egui::TextureOptions::LINEAR));
+        self.preview_output = Some(frame.screen.name.clone());
     }
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
@@ -113,6 +133,13 @@ impl LiSnapApp {
         if !self.captured_frames.is_empty() {
             ui.add_space(8.0);
             ui.strong("Last capture");
+            if let Some(texture) = &self.preview_texture {
+                if let Some(output) = &self.preview_output {
+                    ui.small(format!("Preview: {output}"));
+                }
+                ui.add(egui::Image::new(texture).max_width(ui.available_width()).max_height(360.0));
+                ui.add_space(6.0);
+            }
             egui::Grid::new("capture_results").num_columns(4).striped(true).spacing([20.0, 6.0]).show(ui, |ui| {
                 ui.strong("Output");
                 ui.strong("Pixels");
@@ -185,7 +212,12 @@ impl eframe::App for LiSnapApp {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, mpsc};
+    use std::{
+        sync::{Arc, mpsc},
+        time::SystemTime,
+    };
+
+    use lisnap_core::{PixelSize, RgbaImage, ScreenInfo};
 
     use super::*;
 
@@ -217,6 +249,37 @@ mod tests {
 
         assert!(app.active_capture.is_none());
         assert_eq!(app.capture_message.as_deref(), Some("Capture failed: synthetic failure"));
+    }
+
+    #[test]
+    fn capture_worker_success_builds_preview_texture() {
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "display-1".into(),
+                name: "Display 1".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 2, height: 1 },
+                scale_factor: Some(1.0),
+            },
+            image: RgbaImage::new(PixelSize { width: 2, height: 1 }, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap(),
+            captured_at: SystemTime::now(),
+        };
+        let launcher: CaptureLauncher = Arc::new(move |_request| {
+            let (sender, receiver) = mpsc::channel();
+            sender.send(Ok(vec![frame.clone()])).unwrap();
+            receiver
+        });
+        let context = egui::Context::default();
+        let mut app = LiSnapApp::new(None, Vec::new(), Some(launcher));
+        app.start_capture();
+
+        app.poll_capture(&context);
+
+        assert!(app.active_capture.is_none());
+        assert_eq!(app.captured_frames.len(), 1);
+        assert!(app.preview_texture.is_some());
+        assert_eq!(app.preview_output.as_deref(), Some("Display 1"));
+        assert_eq!(app.capture_message.as_deref(), Some("Captured 1 output(s)."));
     }
 
     #[test]
