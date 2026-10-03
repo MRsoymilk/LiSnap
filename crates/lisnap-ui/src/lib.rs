@@ -1,10 +1,20 @@
 //! Native desktop shell. Full-screen capture overlays are a separate future platform surface.
 mod app;
 
-use eframe::egui;
-use lisnap_core::BackendDescriptor;
+use std::sync::{Arc, mpsc};
 
-pub fn run(selected: Option<BackendDescriptor>, backends: Vec<BackendDescriptor>) -> eframe::Result<()> {
+use eframe::egui;
+use lisnap_core::{BackendDescriptor, CaptureFrame, CaptureRequest};
+
+pub type CaptureResult = Result<Vec<CaptureFrame>, String>;
+pub type CaptureReceiver = mpsc::Receiver<CaptureResult>;
+pub type CaptureLauncher = Arc<dyn Fn(CaptureRequest) -> CaptureReceiver + Send + Sync>;
+
+pub fn run(
+    selected: Option<BackendDescriptor>,
+    backends: Vec<BackendDescriptor>,
+    capture_launcher: Option<CaptureLauncher>,
+) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("lisnap")
@@ -13,5 +23,9 @@ pub fn run(selected: Option<BackendDescriptor>, backends: Vec<BackendDescriptor>
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    eframe::run_native("LiSnap", options, Box::new(move |_cc| Ok(Box::new(app::LiSnapApp::new(selected, backends)))))
+    eframe::run_native(
+        "LiSnap",
+        options,
+        Box::new(move |_cc| Ok(Box::new(app::LiSnapApp::new(selected, backends, capture_launcher)))),
+    )
 }
