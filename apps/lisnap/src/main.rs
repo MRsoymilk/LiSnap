@@ -243,14 +243,15 @@ fn launch_gui(kind: Option<BackendKind>) -> Result<(), String> {
         .transpose()
         .map_err(|error| error.to_string())?
         .map(|backend| backend.descriptor());
-    let (capture_launcher, screen_launcher) = match (kind, selected) {
+    let (capture_launcher, screen_launcher, overlay_launcher) = match (kind, selected) {
         (Some(kind), Some(descriptor)) if descriptor.status == lisnap_core::BackendStatus::Available => {
-            (Some(make_capture_launcher(kind)), Some(make_screen_launcher(kind)))
+            (Some(make_capture_launcher(kind)), Some(make_screen_launcher(kind)), make_overlay_launcher(kind))
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
     let backends = BackendKind::ALL.into_iter().map(BackendKind::descriptor).collect();
-    lisnap_ui::run(selected, backends, capture_launcher, screen_launcher).map_err(|error| error.to_string())
+    lisnap_ui::run_with_overlay(selected, backends, capture_launcher, screen_launcher, overlay_launcher)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "gui")]
@@ -279,6 +280,33 @@ fn make_screen_launcher(kind: BackendKind) -> lisnap_ui::ScreenLauncher {
         });
         receiver
     })
+}
+
+#[cfg(all(feature = "gui", target_os = "linux"))]
+fn make_overlay_launcher(kind: BackendKind) -> Option<lisnap_ui::OverlayLauncher> {
+    if kind != BackendKind::Wayland {
+        return None;
+    }
+    Some(std::sync::Arc::new(move |frame| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match lisnap_platform::run_wayland_frozen_overlay(&frame) {
+                Ok(lisnap_platform::WaylandOverlayOutcome::Selected(rect)) => Ok(Some(rect)),
+                Ok(lisnap_platform::WaylandOverlayOutcome::Cancelled) => Ok(None),
+                Ok(lisnap_platform::WaylandOverlayOutcome::Closed) => {
+                    Err("Wayland compositor closed the selection overlay".into())
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(result);
+        });
+        receiver
+    }))
+}
+
+#[cfg(all(feature = "gui", not(target_os = "linux")))]
+fn make_overlay_launcher(_kind: BackendKind) -> Option<lisnap_ui::OverlayLauncher> {
+    None
 }
 
 #[cfg(not(feature = "gui"))]

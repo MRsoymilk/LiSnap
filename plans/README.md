@@ -27,8 +27,8 @@
 
 ## S2：静态覆盖层与选区
 
-- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能显示冻结帧、动态遮罩/白色边框、鼠标拖拽和 Esc 取消；`lisnap-ui` 已新增异步 Overlay launcher，`Select region` 可消费返回的 `PixelRect` 并自动生成原图裁剪预览。另有 `scripts/validate-wayland-overlay.sh` 可绕过主程序直接做宿主捕获→冻结→拖选→裁剪验收；仍待真实 Hyprland 执行。）
-- [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。（平台 runtime 与 UI launcher 接口均已完成；映射前会确认 seat 同时提供 pointer 与 keyboard，避免进入无法拖选或无法 Esc 退出的独占层。`run_with_overlay()` 保持原 `run()` 兼容，等待 `apps/lisnap` 注入 `run_wayland_frozen_overlay` worker。之后进行宿主 Hyprland 真机验证，再扩展多输出与跨屏选区。）
+- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能显示冻结帧、动态遮罩/白色边框、鼠标拖拽和 Esc 取消；`apps/lisnap` 已将真实 Wayland Overlay worker 注入 `lisnap-ui::run_with_overlay()`，主 GUI 的 `Select region` 会消费返回的 `PixelRect` 并自动生成原图裁剪预览。另有 `scripts/validate-wayland-overlay.sh` 可独立做宿主捕获→冻结→拖选→裁剪验收；仍待真实 Hyprland 执行。）
+- [ ] Wayland 覆盖层平台适配，之后扩展多输出与跨屏选区。（平台 runtime、UI launcher 与应用组合层注入均已完成；映射前会确认 seat 同时提供 pointer 与 keyboard，避免进入无法拖选或无法 Esc 退出的独占层。`run_with_overlay()` 保持原 `run()` 兼容。下一步进行宿主 Hyprland 真机验证，再扩展多输出与跨屏选区。）
 - [ ] 原图裁剪、尺寸提示与选区边界测试。（预览和全屏 Overlay 均使用 `selection_to_pixels` 映射到原始像素；`Preview crop` 直接调用 `RgbaImage::crop`，独立 `wayland-overlay` example 也会对 Overlay 返回的 `PixelRect` 裁原图并输出 RGBA 字节数/FNV64。宿主真机结果仍待验收。）
 
 ## S3：基础截图工具
