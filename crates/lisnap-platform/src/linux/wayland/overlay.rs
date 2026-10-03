@@ -120,7 +120,10 @@ pub(crate) fn lifecycle_connection(
     lifecycle
 }
 
-fn select_output<'a>(state: &'a OverlayState, requested: Option<&str>) -> Result<(u32, &'a OutputRecord), CaptureError> {
+fn select_output<'a>(
+    state: &'a OverlayState,
+    requested: Option<&str>,
+) -> Result<(u32, &'a OutputRecord), CaptureError> {
     if state.outputs.is_empty() {
         return Err(CaptureError::Unsupported(
             "Wayland compositor exposes no wl_output globals for overlay placement".into(),
