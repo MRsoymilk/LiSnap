@@ -103,7 +103,11 @@ fn print_wayland_probe(_socket: Option<&str>) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn run_wlr_capture(cli: &Cli) -> Result<(), String> {
-    let request = lisnap_core::CaptureRequest { screen_id: cli.screen_id.clone(), include_cursor: cli.include_cursor };
+    let request = lisnap_core::CaptureRequest {
+        screen_id: cli.screen_id.clone(),
+        include_cursor: cli.include_cursor,
+        cancellation: None,
+    };
     let frames = match cli.wayland_socket.as_deref() {
         Some(path) => lisnap_platform::capture_wayland_wlr_socket(std::path::Path::new(path), &request),
         None => lisnap_platform::capture_wayland_wlr(&request),

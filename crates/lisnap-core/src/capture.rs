@@ -1,4 +1,11 @@
-use std::{fmt, time::SystemTime};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::SystemTime,
+};
 
 use crate::{CaptureError, LogicalRect, PixelSize, RgbaImage};
 
@@ -48,10 +55,31 @@ pub struct CaptureFrame {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct CaptureCancellation(Arc<AtomicBool>);
+
+impl CaptureCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct CaptureRequest {
     /// None requests all outputs; Some uses the backend's stable output ID.
     pub screen_id: Option<String>,
     pub include_cursor: bool,
+    /// Optional cooperative cancellation shared with the caller.
+    pub cancellation: Option<CaptureCancellation>,
+}
+
+impl CaptureRequest {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.as_ref().is_some_and(CaptureCancellation::is_cancelled)
+    }
 }
 
 /// Native implementations own their connection/thread-affinity requirements.
@@ -61,4 +89,19 @@ pub trait CaptureBackend {
     fn screens(&mut self) -> Result<Vec<ScreenInfo>, CaptureError>;
     /// A successful native capture must return at least one real, immutable frame.
     fn capture(&mut self, request: &CaptureRequest) -> Result<Vec<CaptureFrame>, CaptureError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_is_shared_across_clones() {
+        let cancellation = CaptureCancellation::default();
+        let clone = cancellation.clone();
+        assert!(!cancellation.is_cancelled());
+        clone.cancel();
+        assert!(cancellation.is_cancelled());
+        assert!(CaptureRequest { cancellation: Some(cancellation), ..CaptureRequest::default() }.is_cancelled());
+    }
 }

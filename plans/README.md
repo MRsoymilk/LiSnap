@@ -22,7 +22,7 @@
 - [ ] 连接 Wayland，枚举输出，探测真实协议能力与可用捕获源。（registry 探测与 `--probe-wayland` 已实现；EndlessVibe bubblewrap 未挂载宿主 Wayland socket，真机会话验收待在桌面环境执行。）
 - [x] 按实际能力选择 ext-image-copy-capture 或 wlr-screencopy，无 Portal 回退。已真实绑定 ext capture/source 与 `zwlr_screencopy_manager_v1`，仅在两个 ext manager 均绑定成功时优先 ext，否则回退 wlr。
 - [ ] SHM 单帧捕获，处理格式、步长、旋转、权限拒绝和协议缺失。（wlr 路径已实现 memfd + `wl_shm_pool` 单帧复制，支持 ARGB/XRGB、stride、Y-invert 与协议/格式失败；ext 捕获、超时和更细的权限错误仍待继续。）
-- [ ] 超时、取消、资源释放、非空结果与图像尺寸一致性验证。（wlr 初始化/协商/copy 已统一 5s deadline，超时返回 `CaptureError::Timeout`；frame/buffer 失败路径显式释放，RGBA 构造校验尺寸；外部取消机制仍待实现。）
+- [x] 超时、取消、资源释放、非空结果与图像尺寸一致性验证。wlr 初始化/协商/copy 统一 5s deadline；`CaptureCancellation` 以 ≤50ms 轮询延迟返回 `CaptureError::Cancelled`；frame/buffer 失败路径显式释放，空输出与 RGBA 尺寸均拒绝。
 - [ ] 真机验证：获得当前输出的真实像素，不截入自身选择 UI。
 
 ## S2：静态覆盖层与选区

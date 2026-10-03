@@ -4,7 +4,9 @@ mod error;
 mod geometry;
 mod image;
 
-pub use capture::{BackendDescriptor, BackendStatus, CaptureBackend, CaptureFrame, CaptureRequest, ScreenInfo};
+pub use capture::{
+    BackendDescriptor, BackendStatus, CaptureBackend, CaptureCancellation, CaptureFrame, CaptureRequest, ScreenInfo,
+};
 pub use error::CaptureError;
 pub use geometry::{LogicalRect, PixelRect, PixelSize, selection_to_pixels};
 pub use image::RgbaImage;

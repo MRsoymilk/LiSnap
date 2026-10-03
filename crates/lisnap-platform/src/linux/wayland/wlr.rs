@@ -23,6 +23,7 @@ const WL_OUTPUT_MAX_VERSION: u32 = 4;
 const WLR_SCREENCOPY_MANAGER_MAX_VERSION: u32 = 3;
 const WLR_SCREENCOPY_MANAGER: &str = "zwlr_screencopy_manager_v1";
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_POLL_SLICE: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 struct OutputRecord {
@@ -77,8 +78,15 @@ pub(crate) fn capture_connection(
     let _registry = display.get_registry(&queue_handle, ());
     let mut state = CaptureState::default();
 
-    bounded_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland registry initialization")?;
-    bounded_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland output initialization")?;
+    bounded_roundtrip(
+        &display,
+        &queue_handle,
+        &mut event_queue,
+        &mut state,
+        request,
+        "Wayland registry initialization",
+    )?;
+    bounded_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, request, "Wayland output initialization")?;
 
     let manager = state
         .manager
@@ -92,6 +100,7 @@ pub(crate) fn capture_connection(
     let output_ids = select_output_ids(&state, request.screen_id.as_deref())?;
     let mut frames = Vec::with_capacity(output_ids.len());
     for output_id in output_ids {
+        ensure_not_cancelled(request)?;
         state.buffer_spec = None;
         state.buffer_done = false;
         state.y_invert = false;
@@ -105,7 +114,7 @@ pub(crate) fn capture_connection(
         let frame = manager.capture_output(i32::from(request.include_cursor), &output_proxy, &queue_handle, ());
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
         let capture_result = (|| -> Result<CaptureFrame, CaptureError> {
-            wait_for_buffer_offer(&mut event_queue, &mut state, deadline)?;
+            wait_for_buffer_offer(&mut event_queue, &mut state, request, deadline)?;
             let spec = state
                 .buffer_spec
                 .ok_or_else(|| CaptureError::InvalidFrame("wlr-screencopy did not offer a SHM buffer".into()))?;
@@ -137,7 +146,7 @@ pub(crate) fn capture_connection(
 
             let buffer_result = (|| -> Result<CaptureFrame, CaptureError> {
                 frame.copy(&buffer);
-                wait_for_frame(&mut event_queue, &mut state, deadline)?;
+                wait_for_frame(&mut event_queue, &mut state, request, deadline)?;
 
                 let mut native = vec![0_u8; byte_len];
                 file.seek(SeekFrom::Start(0))
@@ -201,18 +210,23 @@ fn select_output_ids(state: &CaptureState, requested: Option<&str>) -> Result<Ve
     }
 }
 
+fn ensure_not_cancelled(request: &CaptureRequest) -> Result<(), CaptureError> {
+    if request.is_cancelled() { Err(CaptureError::Cancelled) } else { Ok(()) }
+}
+
 fn bounded_roundtrip(
     display: &wl_display::WlDisplay,
     queue_handle: &QueueHandle<CaptureState>,
     event_queue: &mut wayland_client::EventQueue<CaptureState>,
     state: &mut CaptureState,
+    request: &CaptureRequest,
     context: &str,
 ) -> Result<(), CaptureError> {
     state.sync_done = false;
     let _callback = display.sync(queue_handle, ());
     let deadline = Instant::now() + CAPTURE_TIMEOUT;
     while !state.sync_done {
-        dispatch_with_deadline(event_queue, state, deadline, context)?;
+        dispatch_with_deadline(event_queue, state, request, deadline, context)?;
     }
     Ok(())
 }
@@ -220,6 +234,7 @@ fn bounded_roundtrip(
 fn wait_for_buffer_offer(
     event_queue: &mut wayland_client::EventQueue<CaptureState>,
     state: &mut CaptureState,
+    request: &CaptureRequest,
     deadline: Instant,
 ) -> Result<(), CaptureError> {
     loop {
@@ -230,13 +245,14 @@ fn wait_for_buffer_offer(
         if state.buffer_spec.is_some() && (manager_version < 3 || state.buffer_done) {
             return Ok(());
         }
-        dispatch_with_deadline(event_queue, state, deadline, "wlr-screencopy negotiation")?;
+        dispatch_with_deadline(event_queue, state, request, deadline, "wlr-screencopy negotiation")?;
     }
 }
 
 fn wait_for_frame(
     event_queue: &mut wayland_client::EventQueue<CaptureState>,
     state: &mut CaptureState,
+    request: &CaptureRequest,
     deadline: Instant,
 ) -> Result<(), CaptureError> {
     loop {
@@ -245,7 +261,7 @@ fn wait_for_frame(
             Some(FrameState::Failed) => {
                 return Err(CaptureError::BackendFailure("wlr-screencopy compositor rejected the copy".into()));
             }
-            _ => dispatch_with_deadline(event_queue, state, deadline, "wlr-screencopy copy")?,
+            _ => dispatch_with_deadline(event_queue, state, request, deadline, "wlr-screencopy copy")?,
         }
     }
 }
@@ -253,10 +269,12 @@ fn wait_for_frame(
 fn dispatch_with_deadline(
     event_queue: &mut wayland_client::EventQueue<CaptureState>,
     state: &mut CaptureState,
+    request: &CaptureRequest,
     deadline: Instant,
     context: &str,
 ) -> Result<(), CaptureError> {
     loop {
+        ensure_not_cancelled(request)?;
         let dispatched = event_queue
             .dispatch_pending(state)
             .map_err(|error| CaptureError::BackendFailure(format!("{context} dispatch failed: {error}")))?;
@@ -271,16 +289,21 @@ fn dispatch_with_deadline(
             continue;
         };
         let remaining = deadline.checked_duration_since(Instant::now()).ok_or(CaptureError::Timeout)?;
+        let poll_duration = remaining.min(CANCEL_POLL_SLICE);
         let timeout = Timespec {
-            tv_sec: remaining.as_secs().min(i64::MAX as u64) as i64,
-            tv_nsec: i64::from(remaining.subsec_nanos()),
+            tv_sec: poll_duration.as_secs().min(i64::MAX as u64) as i64,
+            tv_nsec: i64::from(poll_duration.subsec_nanos()),
         };
         let connection_fd = read_guard.connection_fd();
         let mut poll_fds = [PollFd::from_borrowed_fd(connection_fd, PollFlags::IN | PollFlags::ERR | PollFlags::HUP)];
         match poll(&mut poll_fds, Some(&timeout)) {
             Ok(0) => {
                 drop(read_guard);
-                return Err(CaptureError::Timeout);
+                ensure_not_cancelled(request)?;
+                if Instant::now() >= deadline {
+                    return Err(CaptureError::Timeout);
+                }
+                continue;
             }
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => {
@@ -506,6 +529,16 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for CaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lisnap_core::CaptureCancellation;
+
+    #[test]
+    fn reports_cancelled_request() {
+        let cancellation = CaptureCancellation::default();
+        let request = CaptureRequest { cancellation: Some(cancellation.clone()), ..CaptureRequest::default() };
+        assert!(ensure_not_cancelled(&request).is_ok());
+        cancellation.cancel();
+        assert!(matches!(ensure_not_cancelled(&request), Err(CaptureError::Cancelled)));
+    }
 
     #[test]
     fn converts_xrgb_stride_and_bgr_order() {
