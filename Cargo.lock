@@ -1162,6 +1162,7 @@ dependencies = [
  "lisnap-core",
  "lisnap-platform",
  "lisnap-ui",
+ "png",
 ]
 
 [[package]]

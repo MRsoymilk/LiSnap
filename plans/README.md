@@ -23,19 +23,22 @@
 - [x] 按实际能力选择 ext-image-copy-capture 或 wlr-screencopy，无 Portal 回退。已真实绑定 ext capture/source 与 `zwlr_screencopy_manager_v1`，仅在两个 ext manager 均绑定成功时优先 ext，否则回退 wlr。
 - [x] SHM 单帧捕获，处理格式、步长、旋转、权限拒绝和协议缺失。wlr 与 ext 均使用 memfd + `wl_shm_pool`；支持 ARGB/XRGB、stride、wlr Y-invert、ext transform 归一化、cursor option、超时/取消及协议/格式失败；Unix socket `PermissionDenied` 映射为 `CaptureError::PermissionDenied`。ext 协议的 `stopped` 本身不区分用户结束与运行时错误，因此保留为后端失败而不误报权限问题。
 - [x] 超时、取消、资源释放、非空结果与图像尺寸一致性验证。wlr 初始化/协商/copy 统一 5s deadline；`CaptureCancellation` 以 ≤50ms 轮询延迟返回 `CaptureError::Cancelled`；frame/buffer 失败路径显式释放，空输出与 RGBA 尺寸均拒绝。
-- [x] 多屏 GUI 捕获目标跟随 LiSnap 窗口所在输出。Wayland 下从 eframe/winit 当前 monitor 解析目标，优先匹配 `wl_output` 名称；仅在分辨率/scale 唯一时允许回退匹配。无法唯一映射时禁止捕获，避免错误落到枚举第一屏或全部输出；已覆盖精确匹配、唯一回退、歧义拒绝单测。
-- [ ] 真机验证：获得当前输出的真实像素，不截入自身选择 UI，并验证 LiSnap 在不同显示器启动/移动后只捕获对应输出。（使用 `sh scripts/validate-wayland.sh` 做 headless 像素验收；GUI 多屏目标仍需宿主 Hyprland 会话验收。）
+- [x] 多屏截图目标解析。开发窗口模式继续跟随窗口所在 monitor；默认直接截图模式在 Hyprland 下读取当前活动 workspace 的 monitor，并只请求对应 `wl_output`。显式 `--screen OUTPUT` 可覆盖自动选择，多输出无法唯一判断时拒绝猜测。
+- [ ] 真机验证：获得当前输出的真实像素，不截入自身选择 UI，并验证从不同 Hyprland 显示器触发 `lisnap` 时只捕获对应输出。（`scripts/validate-wayland.sh` 可做 headless 像素验收；直接启动交互路径仍需宿主多屏会话验收。）
 
 ## S2：静态覆盖层与选区
 
-- [ ] 单屏冻结视觉效果、拖动框选、Esc 取消。（Wayland 平台 runtime 已能显示冻结帧、动态遮罩/白色边框、鼠标拖拽和 Esc 取消；`apps/lisnap` 已将真实 Wayland Overlay worker 注入 `lisnap-ui::run_with_overlay()`，主 GUI 的 `Select region` 会消费返回的 `PixelRect` 并自动生成原图裁剪预览。另有 `scripts/validate-wayland-overlay.sh` 可独立做宿主捕获→冻结→拖选→裁剪验收；仍待真实 Hyprland 执行。）
-- [ ] Wayland 覆盖层平台适配，之后扩展跨屏选区。（平台 runtime、UI launcher 与应用组合层注入均已完成；Overlay 已绑定捕获帧的 `screen.id`，因此多屏单输出路径会显示在同一目标输出。映射前会确认 seat 同时提供 pointer 与 keyboard，避免进入无法拖选或无法 Esc 退出的独占层。`run_with_overlay()` 保持原 `run()` 兼容。下一步进行宿主 Hyprland 多屏真机验证，再扩展跨屏选区。）
-- [ ] 原图裁剪、尺寸提示与选区边界测试。（预览和全屏 Overlay 均使用 `selection_to_pixels` 映射到原始像素；`Preview crop` 直接调用 `RgbaImage::crop`，独立 `wayland-overlay` example 也会对 Overlay 返回的 `PixelRect` 裁原图并输出 RGBA 字节数/FNV64。宿主真机结果仍待验收。）
+- [x] 单屏冻结 Overlay 与拖动框选代码链路：冻结帧、动态遮罩/白色边框、Esc 取消均已实现；默认 `lisnap` 捕获后直接进入该原生 layer-shell surface，不再要求先进入普通桌面窗口。
+- [x] 选区后的编辑态与浮动工具条：画笔、矩形、箭头、文字、Undo、Redo、确认、取消；工具条自动放在选区上下可见区域，标注 surface 使用双 SHM buffer 更新且不抢父 surface 输入。
+- [x] 原图标注合成与裁剪：预览坐标按逻辑尺寸映射回捕获像素，确认时把标注绘制到原始 `RgbaImage` 后裁剪，避免把遮罩/工具条写入最终图片；已有工具条、键盘映射和标注合成测试。
+- [ ] 宿主 Hyprland 真机验收：验证多屏定位、冻结帧、工具条位置、连续画笔、矩形/箭头、文字、撤销/重做与确认/取消。之后再扩展跨屏选区。
 
 ## S3：基础截图工具
 
-- [ ] PNG 导出、复制到剪贴板、快捷键、托盘。
-- [ ] 标注数据模型、矩形/箭头/文字、撤销/重做。
+- [x] PNG 导出：默认保存到 `~/Pictures/LiSnap/`，支持 `--output PATH`；确认时保存带标注的裁剪结果。
+- [x] 标注数据模型、自由画笔、矩形、箭头、基础 ASCII 文字、撤销/重做；支持 `P/R/A/T`、`Ctrl+Z/Ctrl+Y`、Enter、Esc。
+- [ ] Wayland text-input/IME 与中文文字渲染。
+- [ ] 复制到剪贴板、全局快捷键和托盘。
 
 ## S4：其他平台和优化
 

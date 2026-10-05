@@ -2,7 +2,13 @@ mod cli;
 
 use cli::{Action, Cli};
 use lisnap_platform::{BackendKind, default_backend};
-use std::process::ExitCode;
+use std::{
+    fs::{self, File},
+    io::BufWriter,
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn main() -> ExitCode {
     let args = std::env::args_os()
@@ -52,8 +58,157 @@ fn run(cli: Cli) -> Result<(), String> {
         Action::ProbeExtConstraints => run_ext_constraint_probe(&cli),
         Action::CaptureWayland => run_wayland_capture(&cli),
         Action::CaptureWlr => run_wlr_capture(&cli),
-        Action::Gui => launch_gui(cli.backend.or_else(default_backend)),
+        Action::InteractiveCapture => run_interactive_capture(&cli),
+        Action::Window => launch_gui(cli.backend.or_else(default_backend)),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_interactive_capture(cli: &Cli) -> Result<(), String> {
+    let kind = cli.backend.or_else(default_backend).ok_or("no native capture backend detected")?;
+    if kind != BackendKind::Wayland {
+        return Err(format!(
+            "interactive capture currently requires the Wayland backend; detected {kind}. Use --window for the development shell."
+        ));
+    }
+
+    let screen_id = resolve_interactive_wayland_screen(cli)?;
+    let request = lisnap_core::CaptureRequest {
+        screen_id: Some(screen_id.clone()),
+        include_cursor: cli.include_cursor,
+        cancellation: None,
+    };
+    let frames = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::capture_wayland_socket(Path::new(path), &request),
+        None => lisnap_platform::capture_wayland(&request),
+    }
+    .map_err(|error| error.to_string())?;
+    let frame =
+        frames.into_iter().next().ok_or_else(|| format!("Wayland capture returned no frame for output {screen_id}"))?;
+
+    let outcome = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::run_wayland_editor_socket(Path::new(path), &frame),
+        None => lisnap_platform::run_wayland_editor(&frame),
+    }
+    .map_err(|error| error.to_string())?;
+
+    match outcome {
+        lisnap_platform::WaylandEditorOutcome::Accepted { selection, image } => {
+            let output = cli.output_path.as_deref().map(PathBuf::from).unwrap_or_else(default_output_path);
+            save_png(&output, &image)?;
+            println!(
+                "Saved {}x{} annotated capture from {} at {},{} to {}",
+                selection.width,
+                selection.height,
+                frame.screen.id,
+                selection.x,
+                selection.y,
+                output.display()
+            );
+            Ok(())
+        }
+        lisnap_platform::WaylandEditorOutcome::Cancelled => Ok(()),
+        lisnap_platform::WaylandEditorOutcome::Closed => {
+            Err("Wayland compositor closed the interactive screenshot editor".into())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_interactive_capture(_cli: &Cli) -> Result<(), String> {
+    Err("interactive screenshot editing is currently implemented for Linux/Wayland only; use --window".into())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_interactive_wayland_screen(cli: &Cli) -> Result<String, String> {
+    if let Some(screen) = &cli.screen_id {
+        return Ok(screen.clone());
+    }
+    let probe = match cli.wayland_socket.as_deref() {
+        Some(path) => lisnap_platform::probe_wayland_socket(Path::new(path)),
+        None => lisnap_platform::probe_wayland(),
+    }
+    .map_err(|error| error.to_string())?;
+
+    if let Some(active) = hyprland_active_monitor()
+        && probe.outputs.iter().any(|output| output.name.as_deref() == Some(active.as_str()))
+    {
+        return Ok(active);
+    }
+
+    if probe.outputs.len() == 1 {
+        let output = &probe.outputs[0];
+        return Ok(output.name.clone().unwrap_or_else(|| output.global_name.to_string()));
+    }
+
+    Err(
+        "cannot determine the active monitor in this multi-output Wayland session; on Hyprland ensure hyprctl is available, or pass --screen OUTPUT"
+            .into(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn hyprland_active_monitor() -> Option<String> {
+    let output = Command::new("hyprctl").args(["-j", "activeworkspace"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    json_string_field(text, "monitor")
+}
+
+#[cfg(target_os = "linux")]
+fn json_string_field(input: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\"");
+    let mut rest = input.get(input.find(&marker)? + marker.len()..)?.trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    rest = rest.strip_prefix('"')?;
+    let mut result = String::new();
+    let mut escaped = false;
+    for ch in rest.chars() {
+        if escaped {
+            result.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(result);
+        } else {
+            result.push(ch);
+        }
+    }
+    None
+}
+
+fn default_output_path() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Pictures").join("LiSnap"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    base.join(format!("LiSnap-{}-{:03}.png", duration.as_secs(), duration.subsec_millis()))
+}
+
+fn save_png(path: &Path, image: &lisnap_core::RgbaImage) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("creating screenshot directory {} failed: {error}", parent.display()))?;
+    }
+    let file = File::create(path).map_err(|error| format!("creating {} failed: {error}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let size = image.size();
+    let mut encoder = png::Encoder::new(writer, size.width, size.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| format!("writing PNG header failed: {error}"))?;
+    writer.write_image_data(image.pixels()).map_err(|error| format!("writing PNG pixels failed: {error}"))
 }
 
 fn list_screens(kind: Option<BackendKind>) -> Result<(), String> {
@@ -312,4 +467,21 @@ fn make_overlay_launcher(_kind: BackendKind) -> Option<lisnap_ui::OverlayLaunche
 #[cfg(not(feature = "gui"))]
 fn launch_gui(_kind: Option<BackendKind>) -> Result<(), String> {
     Err("GUI support is disabled; rebuild with default features, or use --list-backends".into())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hyprland_active_monitor_name() {
+        let json = r#"{"id":3,"name":"3","monitor":"HDMI-A-1","windows":2}"#;
+        assert_eq!(json_string_field(json, "monitor").as_deref(), Some("HDMI-A-1"));
+    }
+
+    #[test]
+    fn rejects_missing_or_non_string_monitor_field() {
+        assert_eq!(json_string_field(r#"{"name":"3"}"#, "monitor"), None);
+        assert_eq!(json_string_field(r#"{"monitor":3}"#, "monitor"), None);
+    }
 }

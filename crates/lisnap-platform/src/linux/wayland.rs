@@ -1,4 +1,5 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
+mod annotation;
 mod ext;
 mod overlay;
 mod overlay_runtime;
@@ -83,6 +84,13 @@ pub struct WaylandOverlayLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaylandOverlayOutcome {
     Selected(PixelRect),
+    Cancelled,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+pub enum WaylandEditorOutcome {
+    Accepted { selection: PixelRect, image: lisnap_core::RgbaImage },
     Cancelled,
     Closed,
 }
@@ -409,6 +417,26 @@ pub fn run_frozen_overlay(frame: &CaptureFrame) -> Result<WaylandOverlayOutcome,
 
 pub fn run_frozen_overlay_socket(path: &Path, frame: &CaptureFrame) -> Result<WaylandOverlayOutcome, CaptureError> {
     map_overlay_outcome(overlay_runtime::run_connection(connect_socket(path)?, frame)?)
+}
+
+pub fn run_editor(frame: &CaptureFrame) -> Result<WaylandEditorOutcome, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    map_editor_outcome(overlay_runtime::run_editor_connection(connection, frame)?)
+}
+
+pub fn run_editor_socket(path: &Path, frame: &CaptureFrame) -> Result<WaylandEditorOutcome, CaptureError> {
+    map_editor_outcome(overlay_runtime::run_editor_connection(connect_socket(path)?, frame)?)
+}
+
+fn map_editor_outcome(outcome: overlay_runtime::EditorOverlayOutcome) -> Result<WaylandEditorOutcome, CaptureError> {
+    Ok(match outcome {
+        overlay_runtime::EditorOverlayOutcome::Accepted { selection, image } => {
+            WaylandEditorOutcome::Accepted { selection, image }
+        }
+        overlay_runtime::EditorOverlayOutcome::Cancelled => WaylandEditorOutcome::Cancelled,
+        overlay_runtime::EditorOverlayOutcome::Closed => WaylandEditorOutcome::Closed,
+    })
 }
 
 fn map_overlay_outcome(outcome: overlay_runtime::FrozenOverlayOutcome) -> Result<WaylandOverlayOutcome, CaptureError> {

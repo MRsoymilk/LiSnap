@@ -2,12 +2,17 @@ use std::{
     collections::BTreeMap,
     ffi::CString,
     fs::File,
-    io::Write,
+    io::{Seek, SeekFrom, Write},
     os::fd::AsFd,
     time::{Duration, Instant},
 };
 
-use lisnap_core::{CaptureError, CaptureFrame, LogicalRect, PixelRect, PixelSize, selection_to_pixels};
+use lisnap_core::{CaptureError, CaptureFrame, LogicalRect, PixelRect, PixelSize, RgbaImage, selection_to_pixels};
+
+use super::annotation::{
+    Annotation, DraftAnnotation, EditorTool, RectI as AnnotationRect, TextDraft, ToolbarAction, compose_annotated_crop,
+    key_to_ascii, normalized_rect, render_editor_canvas, toolbar_layout,
+};
 use rustix::{
     event::{PollFd, PollFlags, poll},
     fs::{MemfdFlags, memfd_create},
@@ -31,11 +36,34 @@ const LAYER_SHELL: &str = "zwlr_layer_shell_v1";
 const VIEWPORTER: &str = "wp_viewporter";
 const BTN_LEFT: u32 = 0x110;
 const ESC_KEY: u32 = 1;
+const BACKSPACE_KEY: u32 = 14;
+const ENTER_KEY: u32 = 28;
+const LEFT_CTRL_KEY: u32 = 29;
+const LEFT_SHIFT_KEY: u32 = 42;
+const RIGHT_SHIFT_KEY: u32 = 54;
+const RIGHT_CTRL_KEY: u32 = 97;
+const Z_KEY: u32 = 44;
+const Y_KEY: u32 = 21;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrozenOverlayOutcome {
     Selected(PixelRect),
+    Cancelled,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EditorOverlayOutcome {
+    Accepted { selection: PixelRect, image: RgbaImage },
+    Cancelled,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeOutcome {
+    Selected(PixelRect),
+    Accepted { selection: PixelRect, logical_size: PixelSize, annotations: Vec<Annotation> },
     Cancelled,
     Closed,
 }
@@ -70,6 +98,26 @@ struct OverlayVisuals {
     _solid_file: File,
 }
 
+#[derive(Debug)]
+struct CanvasBuffer {
+    buffer: wl_buffer::WlBuffer,
+    file: File,
+    released: bool,
+}
+
+#[derive(Debug)]
+struct EditorCanvas {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    buffers: Vec<CanvasBuffer>,
+    size: PixelSize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CanvasBufferData {
+    slot: usize,
+}
+
 #[derive(Debug, Default)]
 struct RuntimeState {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -87,8 +135,22 @@ struct RuntimeState {
     frame_size: Option<PixelSize>,
     pointer_position: Option<(f64, f64)>,
     drag_anchor: Option<(f64, f64)>,
-    outcome: Option<FrozenOverlayOutcome>,
+    outcome: Option<RuntimeOutcome>,
     visuals: Option<OverlayVisuals>,
+    editor_enabled: bool,
+    editing: bool,
+    selection_logical: Option<AnnotationRect>,
+    selection_pixels: Option<PixelRect>,
+    active_tool: EditorTool,
+    annotations: Vec<Annotation>,
+    redo_annotations: Vec<Annotation>,
+    draft_annotation: Option<DraftAnnotation>,
+    text_draft: Option<TextDraft>,
+    editor_canvas: Option<EditorCanvas>,
+    editor_dirty: bool,
+    shift_pressed: bool,
+    ctrl_pressed: bool,
+    runtime_error: Option<CaptureError>,
     closed: bool,
 }
 
@@ -210,6 +272,102 @@ impl OverlayVisuals {
     }
 }
 
+impl EditorCanvas {
+    fn new(
+        compositor: &wl_compositor::WlCompositor,
+        subcompositor: &wl_subcompositor::WlSubcompositor,
+        shm: &wl_shm::WlShm,
+        parent: &wl_surface::WlSurface,
+        size: PixelSize,
+        queue_handle: &QueueHandle<RuntimeState>,
+    ) -> Result<Self, CaptureError> {
+        let width = i32::try_from(size.width)
+            .map_err(|_| CaptureError::InvalidFrame("editor canvas width exceeds protocol range".into()))?;
+        let height = i32::try_from(size.height)
+            .map_err(|_| CaptureError::InvalidFrame("editor canvas height exceeds protocol range".into()))?;
+        let stride = size
+            .width
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::InvalidFrame("editor canvas stride overflow".into()))?;
+        let byte_len = (stride as usize)
+            .checked_mul(size.height as usize)
+            .ok_or_else(|| CaptureError::InvalidFrame("editor canvas buffer size overflow".into()))?;
+        let byte_len_i32 = i32::try_from(byte_len)
+            .map_err(|_| CaptureError::InvalidFrame("editor canvas buffer exceeds protocol size".into()))?;
+        let stride_i32 = i32::try_from(stride)
+            .map_err(|_| CaptureError::InvalidFrame("editor canvas stride exceeds protocol range".into()))?;
+
+        let surface = compositor.create_surface(queue_handle, ());
+        let empty_input = compositor.create_region(queue_handle, ());
+        surface.set_input_region(Some(&empty_input));
+        empty_input.destroy();
+        let subsurface = subcompositor.get_subsurface(&surface, parent, queue_handle, ());
+        subsurface.set_position(0, 0);
+        subsurface.set_desync();
+
+        let mut buffers = Vec::with_capacity(2);
+        for slot in 0..2 {
+            let name = CString::new(format!("lisnap-editor-{slot}"))
+                .map_err(|_| CaptureError::BackendFailure("invalid editor canvas memfd name".into()))?;
+            let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+                .map_err(|error| CaptureError::BackendFailure(format!("editor memfd_create failed: {error}")))?;
+            let file = File::from(fd);
+            file.set_len(byte_len as u64)
+                .map_err(|error| CaptureError::BackendFailure(format!("resizing editor SHM failed: {error}")))?;
+            let pool = shm.create_pool(file.as_fd(), byte_len_i32, queue_handle, ());
+            let buffer = pool.create_buffer(
+                0,
+                width,
+                height,
+                stride_i32,
+                wl_shm::Format::Argb8888,
+                queue_handle,
+                CanvasBufferData { slot },
+            );
+            pool.destroy();
+            buffers.push(CanvasBuffer { buffer, file, released: true });
+        }
+
+        Ok(Self { surface, subsurface, buffers, size })
+    }
+
+    fn redraw(
+        &mut self,
+        selection: AnnotationRect,
+        tool: EditorTool,
+        annotations: &[Annotation],
+        draft: Option<&DraftAnnotation>,
+        text_draft: Option<&TextDraft>,
+    ) -> Result<bool, CaptureError> {
+        let Some(slot) = self.buffers.iter().position(|buffer| buffer.released) else {
+            return Ok(false);
+        };
+        let pixels = render_editor_canvas(self.size, selection, tool, annotations, draft, text_draft);
+        let buffer = &mut self.buffers[slot];
+        buffer
+            .file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| CaptureError::BackendFailure(format!("seeking editor SHM failed: {error}")))?;
+        buffer
+            .file
+            .write_all(&pixels)
+            .map_err(|error| CaptureError::BackendFailure(format!("writing editor SHM failed: {error}")))?;
+        buffer.released = false;
+        self.surface.attach(Some(&buffer.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, self.size.width as i32, self.size.height as i32);
+        self.surface.commit();
+        Ok(true)
+    }
+
+    fn destroy(self) {
+        for buffer in self.buffers {
+            buffer.buffer.destroy();
+        }
+        self.subsurface.destroy();
+        self.surface.destroy();
+    }
+}
+
 fn selection_visual_rects(
     start: (f64, f64),
     end: (f64, f64),
@@ -250,11 +408,43 @@ pub(crate) fn run_connection(
     connection: Connection,
     frame: &CaptureFrame,
 ) -> Result<FrozenOverlayOutcome, CaptureError> {
+    match run_connection_mode(connection, frame, false)? {
+        RuntimeOutcome::Selected(selection) => Ok(FrozenOverlayOutcome::Selected(selection)),
+        RuntimeOutcome::Cancelled => Ok(FrozenOverlayOutcome::Cancelled),
+        RuntimeOutcome::Closed => Ok(FrozenOverlayOutcome::Closed),
+        RuntimeOutcome::Accepted { .. } => {
+            Err(CaptureError::BackendFailure("selection overlay unexpectedly returned an editor result".into()))
+        }
+    }
+}
+
+pub(crate) fn run_editor_connection(
+    connection: Connection,
+    frame: &CaptureFrame,
+) -> Result<EditorOverlayOutcome, CaptureError> {
+    match run_connection_mode(connection, frame, true)? {
+        RuntimeOutcome::Accepted { selection, logical_size, annotations } => Ok(EditorOverlayOutcome::Accepted {
+            selection,
+            image: compose_annotated_crop(frame, logical_size, selection, &annotations)?,
+        }),
+        RuntimeOutcome::Cancelled => Ok(EditorOverlayOutcome::Cancelled),
+        RuntimeOutcome::Closed => Ok(EditorOverlayOutcome::Closed),
+        RuntimeOutcome::Selected(_) => {
+            Err(CaptureError::BackendFailure("editor overlay unexpectedly returned a selection-only result".into()))
+        }
+    }
+}
+
+fn run_connection_mode(
+    connection: Connection,
+    frame: &CaptureFrame,
+    editor_enabled: bool,
+) -> Result<RuntimeOutcome, CaptureError> {
     let display = connection.display();
     let mut event_queue = connection.new_event_queue::<RuntimeState>();
     let queue_handle = event_queue.handle();
     let _registry = display.get_registry(&queue_handle, ());
-    let mut state = RuntimeState::default();
+    let mut state = RuntimeState { editor_enabled, ..RuntimeState::default() };
 
     bounded_roundtrip(
         &display,
@@ -377,12 +567,25 @@ pub(crate) fn run_connection(
         PixelSize { width: logical_width, height: logical_height },
         &queue_handle,
     )?);
+    if editor_enabled {
+        state.editor_canvas = Some(EditorCanvas::new(
+            &compositor,
+            &subcompositor,
+            &shm,
+            &surface,
+            PixelSize { width: logical_width, height: logical_height },
+            &queue_handle,
+        )?);
+    }
     event_queue
         .flush()
         .map_err(|error| CaptureError::BackendFailure(format!("mapping Wayland overlay failed: {error}")))?;
 
     let outcome = run_input_loop(&mut event_queue, &mut state);
 
+    if let Some(canvas) = state.editor_canvas.take() {
+        canvas.destroy();
+    }
     if let Some(visuals) = state.visuals.take() {
         visuals.destroy();
     }
@@ -410,13 +613,16 @@ fn select_output<'a>(state: &'a RuntimeState, requested: &str) -> Result<&'a Out
 fn run_input_loop(
     event_queue: &mut wayland_client::EventQueue<RuntimeState>,
     state: &mut RuntimeState,
-) -> Result<FrozenOverlayOutcome, CaptureError> {
+) -> Result<RuntimeOutcome, CaptureError> {
     loop {
+        if let Some(error) = state.runtime_error.take() {
+            return Err(error);
+        }
         if let Some(outcome) = state.outcome.take() {
             return Ok(outcome);
         }
         if state.closed {
-            return Ok(FrozenOverlayOutcome::Closed);
+            return Ok(RuntimeOutcome::Closed);
         }
         event_queue
             .blocking_dispatch(state)
@@ -450,6 +656,251 @@ fn pointer_selection(
         LogicalRect { x: 0.0, y: 0.0, width: f64::from(logical_size.width), height: f64::from(logical_size.height) },
         frame_size,
     )
+}
+
+fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
+    if !state.editor_enabled || !state.editing || !state.editor_dirty {
+        return;
+    }
+    let Some(selection) = state.selection_logical else {
+        return;
+    };
+    let annotations = state.annotations.clone();
+    let draft = state.draft_annotation.clone();
+    let text_draft = state.text_draft.clone();
+    let tool = state.active_tool;
+    let Some(canvas) = state.editor_canvas.as_mut() else {
+        return;
+    };
+    match canvas.redraw(selection, tool, &annotations, draft.as_ref(), text_draft.as_ref()) {
+        Ok(true) => {
+            state.editor_dirty = false;
+            if let Err(error) = connection.flush() {
+                state.runtime_error =
+                    Some(CaptureError::BackendFailure(format!("flushing editor overlay failed: {error}")));
+            }
+        }
+        Ok(false) => {}
+        Err(error) => state.runtime_error = Some(error),
+    }
+}
+
+fn commit_text_draft(state: &mut RuntimeState) {
+    let Some(text) = state.text_draft.take() else {
+        return;
+    };
+    if !text.text.is_empty() {
+        state.annotations.push(Annotation::Text { position: text.position, text: text.text });
+        state.redo_annotations.clear();
+    }
+    state.editor_dirty = true;
+}
+
+fn undo_editor(state: &mut RuntimeState) {
+    state.text_draft = None;
+    if let Some(annotation) = state.annotations.pop() {
+        state.redo_annotations.push(annotation);
+    }
+    state.editor_dirty = true;
+}
+
+fn redo_editor(state: &mut RuntimeState) {
+    state.text_draft = None;
+    if let Some(annotation) = state.redo_annotations.pop() {
+        state.annotations.push(annotation);
+    }
+    state.editor_dirty = true;
+}
+
+fn accept_editor(state: &mut RuntimeState) {
+    commit_text_draft(state);
+    if let (Some(selection), Some(logical_size)) = (state.selection_pixels, state.logical_size) {
+        state.outcome =
+            Some(RuntimeOutcome::Accepted { selection, logical_size, annotations: state.annotations.clone() });
+    }
+}
+
+fn handle_toolbar_action(state: &mut RuntimeState, action: ToolbarAction) {
+    match action {
+        ToolbarAction::Tool(tool) => {
+            commit_text_draft(state);
+            state.active_tool = tool;
+            state.draft_annotation = None;
+            state.editor_dirty = true;
+        }
+        ToolbarAction::Undo => undo_editor(state),
+        ToolbarAction::Redo => redo_editor(state),
+        ToolbarAction::Confirm => accept_editor(state),
+        ToolbarAction::Cancel => state.outcome = Some(RuntimeOutcome::Cancelled),
+    }
+}
+
+fn clamp_to_selection(point: (f64, f64), selection: AnnotationRect) -> (f64, f64) {
+    (
+        point.0.clamp(f64::from(selection.x), f64::from(selection.x + selection.width)),
+        point.1.clamp(f64::from(selection.y), f64::from(selection.y + selection.height)),
+    )
+}
+
+fn begin_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection: &Connection) {
+    let Some(selection) = state.selection_logical else {
+        return;
+    };
+    let toolbar = state.logical_size.map(|size| toolbar_layout(selection, size));
+    if let Some(action) = toolbar.as_ref().and_then(|layout| layout.hit_test(point)) {
+        state.drag_anchor = None;
+        handle_toolbar_action(state, action);
+        redraw_editor(state, connection);
+        return;
+    }
+    if !selection.contains(point) {
+        state.drag_anchor = None;
+        return;
+    }
+    let point = clamp_to_selection(point, selection);
+    match state.active_tool {
+        EditorTool::Pen => {
+            commit_text_draft(state);
+            state.draft_annotation = Some(DraftAnnotation::Pen(vec![point]));
+            state.drag_anchor = Some(point);
+        }
+        EditorTool::Rectangle => {
+            commit_text_draft(state);
+            state.draft_annotation = Some(DraftAnnotation::Rectangle { start: point, end: point });
+            state.drag_anchor = Some(point);
+        }
+        EditorTool::Arrow => {
+            commit_text_draft(state);
+            state.draft_annotation = Some(DraftAnnotation::Arrow { start: point, end: point });
+            state.drag_anchor = Some(point);
+        }
+        EditorTool::Text => {
+            commit_text_draft(state);
+            state.text_draft = Some(TextDraft { position: point, text: String::new() });
+            state.drag_anchor = None;
+        }
+    }
+    state.editor_dirty = true;
+    redraw_editor(state, connection);
+}
+
+fn update_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection: &Connection) {
+    let Some(selection) = state.selection_logical else {
+        return;
+    };
+    let point = clamp_to_selection(point, selection);
+    let Some(draft) = state.draft_annotation.as_mut() else {
+        return;
+    };
+    match draft {
+        DraftAnnotation::Pen(points) => {
+            let should_push = points.last().is_none_or(|last| {
+                let dx = last.0 - point.0;
+                let dy = last.1 - point.1;
+                dx * dx + dy * dy >= 1.0
+            });
+            if should_push {
+                points.push(point);
+            }
+        }
+        DraftAnnotation::Rectangle { end, .. } | DraftAnnotation::Arrow { end, .. } => *end = point,
+    }
+    state.editor_dirty = true;
+    redraw_editor(state, connection);
+}
+
+fn finish_editor_pointer(state: &mut RuntimeState, connection: &Connection) {
+    state.drag_anchor = None;
+    if let Some(draft) = state.draft_annotation.take() {
+        let annotation = match draft {
+            DraftAnnotation::Pen(points) if points.len() >= 2 => Some(Annotation::Pen(points)),
+            DraftAnnotation::Rectangle { start, end }
+                if state.logical_size.is_some_and(|size| normalized_rect(start, end, size).is_some()) =>
+            {
+                Some(Annotation::Rectangle { start, end })
+            }
+            DraftAnnotation::Arrow { start, end } if start != end => Some(Annotation::Arrow { start, end }),
+            _ => None,
+        };
+        if let Some(annotation) = annotation {
+            state.annotations.push(annotation);
+            state.redo_annotations.clear();
+        }
+        state.editor_dirty = true;
+        redraw_editor(state, connection);
+    }
+}
+
+fn set_editor_tool(state: &mut RuntimeState, tool: EditorTool, connection: &Connection) {
+    commit_text_draft(state);
+    state.active_tool = tool;
+    state.draft_annotation = None;
+    state.editor_dirty = true;
+    redraw_editor(state, connection);
+}
+
+fn handle_editor_key(state: &mut RuntimeState, key: u32, pressed: bool, connection: &Connection) {
+    match key {
+        LEFT_SHIFT_KEY | RIGHT_SHIFT_KEY => {
+            state.shift_pressed = pressed;
+            return;
+        }
+        LEFT_CTRL_KEY | RIGHT_CTRL_KEY => {
+            state.ctrl_pressed = pressed;
+            return;
+        }
+        _ if !pressed => return,
+        _ => {}
+    }
+
+    if key == ESC_KEY {
+        if state.text_draft.is_some() {
+            state.text_draft = None;
+            state.editor_dirty = true;
+            redraw_editor(state, connection);
+        } else {
+            state.outcome = Some(RuntimeOutcome::Cancelled);
+        }
+        return;
+    }
+
+    if state.ctrl_pressed {
+        if key == Z_KEY {
+            undo_editor(state);
+            redraw_editor(state, connection);
+        } else if key == Y_KEY {
+            redo_editor(state);
+            redraw_editor(state, connection);
+        }
+        return;
+    }
+
+    if let Some(text) = state.text_draft.as_mut() {
+        match key {
+            BACKSPACE_KEY => {
+                text.text.pop();
+                state.editor_dirty = true;
+            }
+            ENTER_KEY => commit_text_draft(state),
+            _ => {
+                if let Some(ch) = key_to_ascii(key, state.shift_pressed) {
+                    text.text.push(ch);
+                    state.editor_dirty = true;
+                }
+            }
+        }
+        redraw_editor(state, connection);
+        return;
+    }
+
+    match key {
+        25 => set_editor_tool(state, EditorTool::Pen, connection),
+        19 => set_editor_tool(state, EditorTool::Rectangle, connection),
+        30 => set_editor_tool(state, EditorTool::Arrow, connection),
+        20 => set_editor_tool(state, EditorTool::Text, connection),
+        ENTER_KEY => accept_editor(state),
+        _ => {}
+    }
 }
 
 fn rgba_to_xrgb(rgba: &[u8]) -> Result<Vec<u8>, CaptureError> {
@@ -715,7 +1166,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
             | wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
                 let current = (surface_x, surface_y);
                 state.pointer_position = Some(current);
-                if let (Some(anchor), Some(logical_size), Some(visuals)) =
+                if state.editing {
+                    if state.draft_annotation.is_some() {
+                        update_editor_pointer(state, current, connection);
+                    }
+                } else if let (Some(anchor), Some(logical_size), Some(visuals)) =
                     (state.drag_anchor, state.logical_size, state.visuals.as_ref())
                 {
                     visuals.update_selection(Some(anchor), Some(current), logical_size);
@@ -725,24 +1180,45 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
             wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. } if button == BTN_LEFT => {
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
-                        state.drag_anchor = state.pointer_position;
-                        if let (Some(current), Some(logical_size), Some(visuals)) =
-                            (state.pointer_position, state.logical_size, state.visuals.as_ref())
-                        {
-                            visuals.update_selection(Some(current), Some(current), logical_size);
-                            let _ = connection.flush();
+                        let Some(current) = state.pointer_position else {
+                            return;
+                        };
+                        if state.editing {
+                            begin_editor_pointer(state, current, connection);
+                        } else {
+                            state.drag_anchor = Some(current);
+                            if let (Some(logical_size), Some(visuals)) = (state.logical_size, state.visuals.as_ref()) {
+                                visuals.update_selection(Some(current), Some(current), logical_size);
+                                let _ = connection.flush();
+                            }
                         }
                     }
                     wl_pointer::ButtonState::Released => {
+                        if state.editing {
+                            finish_editor_pointer(state, connection);
+                            return;
+                        }
                         if let (Some(anchor), Some(current), Some(logical_size), Some(frame_size)) =
                             (state.drag_anchor.take(), state.pointer_position, state.logical_size, state.frame_size)
                         {
-                            if let Some(visuals) = state.visuals.as_ref() {
-                                visuals.update_selection(Some(anchor), Some(current), logical_size);
-                                let _ = connection.flush();
-                            }
-                            if let Some(selection) = pointer_selection(anchor, current, logical_size, frame_size) {
-                                state.outcome = Some(FrozenOverlayOutcome::Selected(selection));
+                            let logical_selection = normalized_rect(anchor, current, logical_size);
+                            let pixel_selection = pointer_selection(anchor, current, logical_size, frame_size);
+                            if let (Some(logical_selection), Some(pixel_selection)) =
+                                (logical_selection, pixel_selection)
+                            {
+                                if let Some(visuals) = state.visuals.as_ref() {
+                                    visuals.update_selection(Some(anchor), Some(current), logical_size);
+                                    let _ = connection.flush();
+                                }
+                                if state.editor_enabled {
+                                    state.editing = true;
+                                    state.selection_logical = Some(logical_selection);
+                                    state.selection_pixels = Some(pixel_selection);
+                                    state.editor_dirty = true;
+                                    redraw_editor(state, connection);
+                                } else {
+                                    state.outcome = Some(RuntimeOutcome::Selected(pixel_selection));
+                                }
                             } else if let Some(visuals) = state.visuals.as_ref() {
                                 visuals.update_selection(None, None, logical_size);
                                 let _ = connection.flush();
@@ -763,14 +1239,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for RuntimeState {
         _keyboard: &wl_keyboard::WlKeyboard,
         event: wl_keyboard::Event,
         _data: &(),
-        _connection: &Connection,
+        connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
-        if let wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } = event
-            && key == ESC_KEY
-            && matches!(key_state, wl_keyboard::KeyState::Pressed | wl_keyboard::KeyState::Repeated)
-        {
-            state.outcome = Some(FrozenOverlayOutcome::Cancelled);
+        if let wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } = event {
+            let pressed = matches!(key_state, wl_keyboard::KeyState::Pressed | wl_keyboard::KeyState::Repeated);
+            if state.editor_enabled && state.editing {
+                handle_editor_key(state, key, pressed, connection);
+            } else if key == ESC_KEY && pressed {
+                state.outcome = Some(RuntimeOutcome::Cancelled);
+            }
         }
     }
 }
@@ -808,6 +1286,26 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for RuntimeState {
         _connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        data: &CanvasBufferData,
+        connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        if matches!(event, wl_buffer::Event::Release) {
+            if let Some(canvas) = state.editor_canvas.as_mut()
+                && let Some(buffer) = canvas.buffers.get_mut(data.slot)
+            {
+                buffer.released = true;
+            }
+            redraw_editor(state, connection);
+        }
     }
 }
 

@@ -14,6 +14,7 @@ gui = ["dep:lisnap-ui"]
 lisnap-core.workspace = true
 lisnap-platform.workspace = true
 lisnap-ui = { workspace = true, optional = true }
+png = "0.18.1"
 
 [lints]
 workspace = true

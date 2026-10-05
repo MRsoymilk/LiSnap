@@ -1,11 +1,12 @@
 use lisnap_platform::BackendKind;
 
-pub const HELP: &str = "LiSnap - cross-platform screenshot tool (framework stage)\n\nUsage: lisnap [--backend auto|wayland|x11|windows|macos]\n       lisnap --list-backends\n       lisnap --list-screens [--backend auto|wayland|x11|windows|macos]\n       lisnap --probe-wayland [--wayland-socket PATH]\n       lisnap --probe-ext-constraints [--wayland-socket PATH] [--screen ID]\n       lisnap --capture-wayland [--wayland-socket PATH] [--screen ID] [--include-cursor]\n       lisnap --capture-wlr [--wayland-socket PATH] [--screen ID] [--include-cursor]\n       lisnap --help\n       lisnap --version\n\nWithout options, opens the desktop shell. Native capture is still under active implementation.\n--list-backends does not open a window or request screen access.\n--list-screens uses the selected native backend to enumerate stable output IDs without capturing pixels.\n--probe-wayland reports outputs/capture protocols without capturing pixels.\n--probe-ext-constraints creates an ext-image-copy-capture session and reports SHM constraints without capturing pixels.\n--capture-wayland uses ext-image-copy-capture when available and falls back to wlr-screencopy, then prints frame metadata/checksums.\n--capture-wlr forces the wlr-screencopy SHM path for diagnostics.\n";
+pub const HELP: &str = "LiSnap - cross-platform screenshot tool\n\nUsage: lisnap [--backend auto|wayland] [--screen ID] [--output PATH] [--include-cursor]\n       lisnap --window [--backend auto|wayland|x11|windows|macos]\n       lisnap --list-backends\n       lisnap --list-screens [--backend auto|wayland|x11|windows|macos]\n       lisnap --probe-wayland [--wayland-socket PATH]\n       lisnap --probe-ext-constraints [--wayland-socket PATH] [--screen ID]\n       lisnap --capture-wayland [--wayland-socket PATH] [--screen ID] [--include-cursor]\n       lisnap --capture-wlr [--wayland-socket PATH] [--screen ID] [--include-cursor]\n       lisnap --help\n       lisnap --version\n\nWithout an action, starts the interactive screenshot editor directly. On Hyprland, the active monitor is used automatically.\n--window opens the development/diagnostic desktop shell.\n--output writes the accepted annotated crop to the requested PNG path; otherwise LiSnap writes under ~/Pictures/LiSnap.\n--list-backends does not open a window or request screen access.\n--list-screens uses the selected native backend to enumerate stable output IDs without capturing pixels.\n--probe-wayland reports outputs/capture protocols without capturing pixels.\n--probe-ext-constraints creates an ext-image-copy-capture session and reports SHM constraints without capturing pixels.\n--capture-wayland uses ext-image-copy-capture when available and falls back to wlr-screencopy, then prints frame metadata/checksums.\n--capture-wlr forces the wlr-screencopy SHM path for diagnostics.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
     #[default]
-    Gui,
+    InteractiveCapture,
+    Window,
     ListBackends,
     ListScreens,
     ProbeWayland,
@@ -22,6 +23,7 @@ pub struct Cli {
     pub backend: Option<BackendKind>,
     pub wayland_socket: Option<String>,
     pub screen_id: Option<String>,
+    pub output_path: Option<String>,
     pub include_cursor: bool,
 }
 
@@ -33,10 +35,12 @@ impl Cli {
         let mut backend_seen = false;
         let mut wayland_socket_seen = false;
         let mut screen_seen = false;
+        let mut output_seen = false;
         while let Some(arg) = args.next() {
             let action = match arg.as_str() {
                 "-h" | "--help" => Some(Action::Help),
                 "-V" | "--version" => Some(Action::Version),
+                "--window" => Some(Action::Window),
                 "--list-backends" => Some(Action::ListBackends),
                 "--list-screens" => Some(Action::ListScreens),
                 "--probe-wayland" => Some(Action::ProbeWayland),
@@ -57,6 +61,14 @@ impl Cli {
                     }
                     cli.screen_id = Some(args.next().ok_or("--screen requires an output ID")?);
                     screen_seen = true;
+                    None
+                }
+                "--output" => {
+                    if output_seen {
+                        return Err("--output may only be specified once".into());
+                    }
+                    cli.output_path = Some(args.next().ok_or("--output requires a path")?);
+                    output_seen = true;
                     None
                 }
                 "--include-cursor" => {
@@ -80,7 +92,7 @@ impl Cli {
             if let Some(action) = action {
                 if action_seen {
                     return Err(
-                        "choose only one of --help, --version, --list-backends, --list-screens, --probe-wayland, --probe-ext-constraints, --capture-wayland, or --capture-wlr"
+                        "choose only one of --window, --help, --version, --list-backends, --list-screens, --probe-wayland, --probe-ext-constraints, --capture-wayland, or --capture-wlr"
                             .into(),
                     );
                 }
@@ -91,21 +103,32 @@ impl Cli {
         if cli.wayland_socket.is_some()
             && !matches!(
                 cli.action,
-                Action::ProbeWayland | Action::ProbeExtConstraints | Action::CaptureWayland | Action::CaptureWlr
+                Action::InteractiveCapture
+                    | Action::ProbeWayland
+                    | Action::ProbeExtConstraints
+                    | Action::CaptureWayland
+                    | Action::CaptureWlr
             )
         {
             return Err(
-                "--wayland-socket requires --probe-wayland, --probe-ext-constraints, --capture-wayland, or --capture-wlr"
-                    .into(),
+                "--wayland-socket is only valid for interactive Wayland capture or Wayland diagnostic actions".into()
             );
         }
         if cli.screen_id.is_some()
-            && !matches!(cli.action, Action::ProbeExtConstraints | Action::CaptureWayland | Action::CaptureWlr)
+            && !matches!(
+                cli.action,
+                Action::InteractiveCapture | Action::ProbeExtConstraints | Action::CaptureWayland | Action::CaptureWlr
+            )
         {
-            return Err("--screen requires --probe-ext-constraints, --capture-wayland, or --capture-wlr".into());
+            return Err("--screen is only valid for interactive capture or Wayland capture diagnostics".into());
         }
-        if cli.include_cursor && !matches!(cli.action, Action::CaptureWayland | Action::CaptureWlr) {
-            return Err("--include-cursor requires --capture-wayland or --capture-wlr".into());
+        if cli.output_path.is_some() && cli.action != Action::InteractiveCapture {
+            return Err("--output is only valid for interactive capture".into());
+        }
+        if cli.include_cursor
+            && !matches!(cli.action, Action::InteractiveCapture | Action::CaptureWayland | Action::CaptureWlr)
+        {
+            return Err("--include-cursor is only valid for interactive capture or Wayland capture diagnostics".into());
         }
         Ok(cli)
     }
@@ -119,14 +142,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_gui_with_automatic_backend() {
+    fn defaults_to_interactive_capture_with_automatic_backend() {
         assert_eq!(parse(&[]).unwrap(), Cli::default());
+        assert_eq!(parse(&[]).unwrap().action, Action::InteractiveCapture);
     }
 
     #[test]
     fn parses_explicit_backend_and_headless_listing() {
         assert_eq!(parse(&["--backend", "wayland"]).unwrap().backend, Some(BackendKind::Wayland));
         assert_eq!(parse(&["--backend", "auto"]).unwrap().backend, None);
+        assert_eq!(parse(&["--window"]).unwrap().action, Action::Window);
         assert_eq!(parse(&["--list-backends"]).unwrap().action, Action::ListBackends);
         assert_eq!(parse(&["--list-screens"]).unwrap().action, Action::ListScreens);
         assert_eq!(parse(&["--list-screens", "--backend", "wayland"]).unwrap().backend, Some(BackendKind::Wayland));
@@ -142,6 +167,11 @@ mod tests {
         assert_eq!(capture.action, Action::CaptureWlr);
         assert_eq!(capture.screen_id.as_deref(), Some("DP-1"));
         assert!(capture.include_cursor);
+        let interactive = parse(&["--screen", "DP-1", "--output", "/tmp/lisnap.png", "--include-cursor"]).unwrap();
+        assert_eq!(interactive.action, Action::InteractiveCapture);
+        assert_eq!(interactive.screen_id.as_deref(), Some("DP-1"));
+        assert_eq!(interactive.output_path.as_deref(), Some("/tmp/lisnap.png"));
+        assert!(interactive.include_cursor);
         assert_eq!(
             parse(&["--probe-wayland", "--wayland-socket", "/run/user/1000/wayland-1"])
                 .unwrap()
@@ -168,8 +198,7 @@ mod tests {
         assert!(parse(&["--capture-wlr", "--version"]).is_err());
         assert!(parse(&["--capture-wayland", "--version"]).is_err());
         assert!(parse(&["--probe-ext-constraints", "--help"]).is_err());
-        assert!(parse(&["--wayland-socket", "/run/user/1000/wayland-1"]).is_err());
-        assert!(parse(&["--screen", "DP-1"]).is_err());
-        assert!(parse(&["--include-cursor"]).is_err());
+        assert!(parse(&["--window", "--screen", "DP-1"]).is_err());
+        assert!(parse(&["--list-backends", "--output", "/tmp/a.png"]).is_err());
     }
 }

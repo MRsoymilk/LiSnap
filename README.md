@@ -1,8 +1,8 @@
 # LiSnap
 
-使用 Rust 开发的跨平台截屏工具。当前版本 `0.1.0`，处于项目框架阶段，不依赖 Qt。
+使用 Rust 开发的跨平台截屏工具。当前版本 `0.1.0`，不依赖 Qt。
 
-Linux/Wayland 已实现真实单帧捕获与全屏选区 Overlay 代码链路：优先使用 `ext-image-copy-capture`，不可用时回退 `wlr-screencopy`；冻结选区使用 `zwlr_layer_shell_v1`、SHM、`wp_viewporter` 和 `wl_subcompositor`，不经过 Portal。X11、Windows、macOS 仍是明确失败的占位实现；不会返回模拟桌面、空图片或虚假的成功结果。Wayland Overlay 仍需在宿主 Hyprland 会话完成真机验收。
+Linux/Wayland 已实现直接启动截图的交互链路：优先使用 `ext-image-copy-capture`，不可用时回退 `wlr-screencopy`；冻结屏幕与选区编辑使用 `zwlr_layer_shell_v1`、SHM、`wp_viewporter` 和 `wl_subcompositor`，不经过 Portal。完成选区后显示浮动工具条，可使用自由画笔、矩形、箭头、文字、撤销/重做、确认/取消；确认后输出带标注的 PNG。X11、Windows、macOS 仍是明确失败的占位实现。Wayland 编辑器仍需在宿主 Hyprland 多屏会话完成真机验收。
 
 ## 技术结构
 
@@ -35,7 +35,9 @@ LiSnap/
 
 ```sh
 cargo run -p lisnap
-cargo run -p lisnap -- --backend wayland
+cargo run -p lisnap -- --output ~/Pictures/LiSnap/manual.png
+cargo run -p lisnap -- --screen DP-1
+cargo run -p lisnap -- --window
 cargo run -p lisnap -- --list-backends
 cargo run -p lisnap --no-default-features -- --list-backends
 cargo run -p lisnap --no-default-features -- --list-screens
@@ -43,7 +45,9 @@ cargo run -p lisnap --no-default-features -- --probe-wayland
 cargo run -p lisnap --no-default-features -- --capture-wayland
 ```
 
-不带参数时启动桌面框架窗口。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`；指定非本机平台的后端会报错。`--list-backends` 只显示后端清单；`--list-screens` 通过选定的 `CaptureBackend::screens()` 输出稳定 screen ID、名称、像素尺寸和 scale，不捕获屏幕像素。
+不带参数时直接进入交互式截图，不先打开普通主窗口。在 Hyprland 多屏环境中会读取当前活动 monitor，只捕获对应 `wl_output`；也可以用 `--screen OUTPUT` 显式指定。`--window` 保留原来的开发/诊断桌面窗口。`--output PATH` 指定确认后的 PNG 路径；未指定时保存到 `~/Pictures/LiSnap/`。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`，但当前交互式编辑器只实现 Wayland。
+
+截图流程为：捕获当前输出 → 显示冻结画面 → 拖动选区 → 浮动工具条编辑 → 确认保存 PNG。工具条当前包含画笔、矩形、箭头、文字、Undo、Redo、确认和取消；快捷键支持 `P/R/A/T` 切换工具、`Ctrl+Z/Ctrl+Y` 撤销/重做、Enter 确认、Esc 取消。文字输入第一版支持英文、数字及常用 ASCII 符号；Wayland IME/中文输入尚未接入。
 
 自动后端候选仍只依据操作系统及会话环境提示；真正捕获时会连接 Wayland registry 并按实际绑定能力选择 `ext-image-copy-capture` 或 `wlr-screencopy`。没有桌面会话、协议缺失、权限拒绝或帧约束不兼容时会明确失败，不伪造显示器信息。
 
@@ -90,10 +94,10 @@ LISNAP_SCREEN=DP-1 sh scripts/validate-wayland-overlay.sh
 
 ### 当前验证结果
 
-在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试、`cargo clippy --workspace --all-targets -- -D warnings` 以及 GUI 启动验证均已通过。Wayland 捕获覆盖 registry/output 枚举、ext/wlr manager、SHM 单帧复制、ARGB/XRGB、stride、Y-invert/transform、cursor option、超时和取消；桌面窗口通过 worker 自动枚举/捕获输出。多屏 Wayland GUI 会在捕获前读取 LiSnap 窗口当前所在 monitor，并映射到稳定的 `wl_output` ID，只请求该输出；优先按输出名称匹配，必要时只在分辨率/scale 唯一时回退匹配，无法唯一确认时禁止捕获而不是退回第一块屏或全部输出。S2 代码链路也已接通：`CaptureFrame` 可映射为对应输出上的全屏 layer-shell 冻结帧，分数缩放由 `wp_viewporter` 处理，拖动时由无输入区域的 subsurface 绘制半透明遮罩/白色边框，Esc 取消，返回 `PixelRect` 后 UI 自动裁原图。当前自动化 bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实桌面像素、多屏目标选择和 Overlay 显示/输入仍必须在宿主 Hyprland 会话最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后验收。
+在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试以及 `cargo clippy --workspace --all-targets -- -D warnings` 均已通过。Wayland 捕获覆盖 registry/output 枚举、ext/wlr manager、SHM 单帧复制、ARGB/XRGB、stride、Y-invert/transform、cursor option、超时和取消；交互编辑器已覆盖选区、工具条布局/命中、CPU 标注合成、PNG 输出入口和 Hyprland monitor 字段解析。冻结帧与工具条使用原生 layer-shell/subsurface，标注采用双 SHM buffer 更新，最终直接合成到原始捕获像素后裁剪输出。当前 EndlessVibe bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实多屏目标选择、工具条显示、鼠标/键盘输入与保存结果仍必须在宿主 Hyprland 会话最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成。
 
 ## 当前范围
 
-已实现 workspace、CLI、桌面窗口、后台输出枚举与 Capture/Cancel worker、Linux/Wayland 多屏环境下跟随 LiSnap 窗口所在输出的单屏捕获、首帧静态预览、全屏冻结 Overlay/拖选/Esc 取消的代码链路、原图裁剪、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 捕获仍未实现；Wayland 多屏宿主真机验收、跨屏选区、标注、PNG 导出、剪贴板、全局快捷键和托盘仍待开发。
+已实现 workspace、CLI、开发诊断窗口、Linux/Wayland 直接启动截图、Hyprland 活动输出定位、冻结 Overlay、拖选、浮动工具条、自由画笔、矩形、箭头、基础文字、撤销/重做、确认/取消、原图标注合成、PNG 导出、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 交互截图仍未实现；Wayland 宿主真机验收、中文/IME 文字输入、剪贴板、全局快捷键、托盘和跨屏选区仍待开发。
 
-下一步优先完成 **Wayland 多屏下“窗口在哪块屏幕，截图就在哪块屏幕”以及冻结 Overlay 的宿主 Hyprland 真机验收**；通过后再扩展跨屏选区。不要把自动化环境中的编译/单测当成真实 compositor 验收。
+下一步优先完成 **Hyprland 多屏下直接启动截图 + 工具条标注的真机验收**，随后补中文/IME 与剪贴板。不要把自动化环境中的编译/单测当成真实 compositor 验收。
