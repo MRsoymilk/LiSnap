@@ -13,6 +13,58 @@ struct ActiveCapture {
     cancellation: CaptureCancellation,
 }
 
+#[derive(Debug, Clone)]
+struct WindowMonitorHint {
+    name: Option<String>,
+    pixel_size: PixelSize,
+    scale_factor: f64,
+}
+
+fn unique_screen_id<'a>(mut matches: impl Iterator<Item = &'a ScreenInfo>) -> Option<String> {
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.id.clone())
+}
+
+fn resolve_window_output(screens: &[ScreenInfo], monitor: &WindowMonitorHint) -> Option<String> {
+    if let Some(name) = monitor.name.as_deref() {
+        if let Some(screen) = screens.iter().find(|screen| screen.id == name) {
+            return Some(screen.id.clone());
+        }
+        if let Some(id) = unique_screen_id(screens.iter().filter(|screen| screen.name == name)) {
+            return Some(id);
+        }
+        if let Some(id) = unique_screen_id(
+            screens
+                .iter()
+                .filter(|screen| screen.id.eq_ignore_ascii_case(name) || screen.name.eq_ignore_ascii_case(name)),
+        ) {
+            return Some(id);
+        }
+    }
+
+    unique_screen_id(screens.iter().filter(|screen| {
+        screen.pixel_size.width == monitor.pixel_size.width
+            && screen.pixel_size.height == monitor.pixel_size.height
+            && screen.scale_factor.is_none_or(|scale| (scale - monitor.scale_factor).abs() < 0.01)
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_window_monitor(frame: &eframe::Frame) -> Option<WindowMonitorHint> {
+    let monitor = frame.winit_window()?.current_monitor()?;
+    let size = monitor.size();
+    Some(WindowMonitorHint {
+        name: monitor.name(),
+        pixel_size: PixelSize { width: size.width, height: size.height },
+        scale_factor: monitor.scale_factor(),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_window_monitor(_frame: &eframe::Frame) -> Option<WindowMonitorHint> {
+    None
+}
+
 pub(crate) struct LiSnapApp {
     selected: Option<BackendDescriptor>,
     backends: Vec<BackendDescriptor>,
@@ -25,6 +77,8 @@ pub(crate) struct LiSnapApp {
     screens: Vec<ScreenInfo>,
     screens_requested: bool,
     screen_message: Option<String>,
+    follow_window_output: bool,
+    window_output_message: Option<String>,
     active_capture: Option<ActiveCapture>,
     captured_frames: Vec<CaptureFrame>,
     preview_texture: Option<egui::TextureHandle>,
@@ -45,6 +99,7 @@ impl LiSnapApp {
         screen_launcher: Option<ScreenLauncher>,
         overlay_launcher: Option<OverlayLauncher>,
     ) -> Self {
+        let follow_window_output = selected.is_some_and(|backend| backend.id == "wayland");
         Self {
             selected,
             backends,
@@ -57,6 +112,8 @@ impl LiSnapApp {
             screens: Vec::new(),
             screens_requested: false,
             screen_message: None,
+            follow_window_output,
+            window_output_message: None,
             active_capture: None,
             captured_frames: Vec::new(),
             preview_texture: None,
@@ -124,8 +181,49 @@ impl LiSnapApp {
         }
     }
 
+    fn sync_window_output(&mut self, frame: &eframe::Frame) {
+        if !self.follow_window_output || self.screens.is_empty() {
+            return;
+        }
+
+        let Some(monitor) = current_window_monitor(frame) else {
+            self.request.screen_id = None;
+            self.window_output_message = Some(
+                "Current Wayland window output is unavailable; capture is disabled to avoid using the wrong screen."
+                    .into(),
+            );
+            return;
+        };
+
+        match resolve_window_output(&self.screens, &monitor) {
+            Some(id) => {
+                let label = self
+                    .screens
+                    .iter()
+                    .find(|screen| screen.id == id)
+                    .map(|screen| format!("{} ({})", screen.name, screen.id))
+                    .unwrap_or_else(|| id.clone());
+                self.request.screen_id = Some(id);
+                self.window_output_message = Some(format!("Capture target follows LiSnap window: {label}."));
+            }
+            None => {
+                self.request.screen_id = None;
+                let monitor_name = monitor.name.as_deref().unwrap_or("<unnamed>");
+                self.window_output_message = Some(format!(
+                    "Cannot map current Wayland monitor {monitor_name} ({}x{}, scale {:.2}) to a capture output; capture is disabled.",
+                    monitor.pixel_size.width, monitor.pixel_size.height, monitor.scale_factor
+                ));
+            }
+        }
+    }
+
     fn start_capture(&mut self) {
         if self.active_capture.is_some() || self.overlay_receiver.is_some() {
+            return;
+        }
+        if self.follow_window_output && self.request.screen_id.is_none() {
+            self.capture_message =
+                Some("Capture blocked: the current Wayland window output has not been resolved.".into());
             return;
         }
         let Some(launcher) = self.capture_launcher.as_ref() else {
@@ -346,27 +444,47 @@ impl LiSnapApp {
             {
                 self.refresh_screens();
             }
-            ui.add_enabled_ui(!busy, |ui| {
+            if self.follow_window_output {
                 let selected_text = self
                     .request
                     .screen_id
                     .as_ref()
                     .and_then(|id| self.screens.iter().find(|screen| &screen.id == id))
-                    .map_or("All outputs", |screen| screen.name.as_str());
-                egui::ComboBox::from_id_salt("capture_output").selected_text(selected_text).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.request.screen_id, None, "All outputs");
-                    for screen in &self.screens {
-                        ui.selectable_value(&mut self.request.screen_id, Some(screen.id.clone()), &screen.name);
-                    }
+                    .map_or("resolving current window…".into(), |screen| format!("{} ({})", screen.name, screen.id));
+                ui.label(format!("Current window output: {selected_text}"));
+            } else {
+                ui.add_enabled_ui(!busy, |ui| {
+                    let selected_text = self
+                        .request
+                        .screen_id
+                        .as_ref()
+                        .and_then(|id| self.screens.iter().find(|screen| &screen.id == id))
+                        .map_or("All outputs", |screen| screen.name.as_str());
+                    egui::ComboBox::from_id_salt("capture_output").selected_text(selected_text).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.request.screen_id, None, "All outputs");
+                        for screen in &self.screens {
+                            ui.selectable_value(&mut self.request.screen_id, Some(screen.id.clone()), &screen.name);
+                        }
+                    });
                 });
-            });
+            }
         });
         if let Some(message) = &self.screen_message {
             ui.small(message);
         }
+        if let Some(message) = &self.window_output_message {
+            ui.small(message);
+        }
 
+        let capture_target_ready = !self.follow_window_output || self.request.screen_id.is_some();
         ui.horizontal(|ui| {
-            if ui.add_enabled(self.capture_launcher.is_some() && !busy, egui::Button::new("Capture screen")).clicked() {
+            if ui
+                .add_enabled(
+                    self.capture_launcher.is_some() && !busy && capture_target_ready,
+                    egui::Button::new("Capture screen"),
+                )
+                .clicked()
+            {
                 self.start_capture();
             }
             if ui.add_enabled(capture_busy, egui::Button::new("Cancel capture")).clicked() {
@@ -489,7 +607,9 @@ impl LiSnapApp {
         });
         ui.add_space(12.0);
         ui.separator();
-        ui.small("Next: complete host Wayland pixel validation, then implement the static selection overlay.");
+        ui.small(
+            "Next: validate current-output targeting and the frozen overlay on a real Wayland multi-monitor session.",
+        );
     }
 }
 
@@ -505,6 +625,7 @@ impl eframe::App for LiSnapApp {
             self.refresh_screens();
         }
         self.poll_screens(ui.ctx());
+        self.sync_window_output(_frame);
         self.poll_capture(ui.ctx());
         self.poll_overlay(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
@@ -562,6 +683,84 @@ mod tests {
         assert_eq!(app.screens[0].id, "DP-1");
         assert_eq!(app.request.screen_id, None);
         assert_eq!(app.screen_message.as_deref(), Some("Found 1 output(s)."));
+    }
+
+    #[test]
+    fn window_monitor_prefers_exact_wayland_output_name() {
+        let screens = vec![
+            ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display A".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 1920, height: 1080 },
+                scale_factor: Some(1.0),
+            },
+            ScreenInfo {
+                id: "HDMI-A-1".into(),
+                name: "Display B".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 1920, height: 1080 },
+                scale_factor: Some(1.0),
+            },
+        ];
+        let monitor = WindowMonitorHint {
+            name: Some("HDMI-A-1".into()),
+            pixel_size: PixelSize { width: 1920, height: 1080 },
+            scale_factor: 1.0,
+        };
+
+        assert_eq!(resolve_window_output(&screens, &monitor).as_deref(), Some("HDMI-A-1"));
+    }
+
+    #[test]
+    fn window_monitor_uses_unique_mode_only_as_fallback() {
+        let screens = vec![
+            ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display A".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 2560, height: 1440 },
+                scale_factor: Some(1.0),
+            },
+            ScreenInfo {
+                id: "HDMI-A-1".into(),
+                name: "Display B".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 1920, height: 1080 },
+                scale_factor: Some(1.0),
+            },
+        ];
+        let monitor = WindowMonitorHint {
+            name: Some("unknown monitor".into()),
+            pixel_size: PixelSize { width: 2560, height: 1440 },
+            scale_factor: 1.0,
+        };
+
+        assert_eq!(resolve_window_output(&screens, &monitor).as_deref(), Some("DP-1"));
+    }
+
+    #[test]
+    fn window_monitor_rejects_ambiguous_mode_fallback() {
+        let screens = vec![
+            ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display A".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 1920, height: 1080 },
+                scale_factor: Some(1.0),
+            },
+            ScreenInfo {
+                id: "HDMI-A-1".into(),
+                name: "Display B".into(),
+                logical_geometry: None,
+                pixel_size: PixelSize { width: 1920, height: 1080 },
+                scale_factor: Some(1.0),
+            },
+        ];
+        let monitor =
+            WindowMonitorHint { name: None, pixel_size: PixelSize { width: 1920, height: 1080 }, scale_factor: 1.0 };
+
+        assert_eq!(resolve_window_output(&screens, &monitor), None);
     }
 
     #[test]

@@ -90,10 +90,10 @@ LISNAP_SCREEN=DP-1 sh scripts/validate-wayland-overlay.sh
 
 ### 当前验证结果
 
-在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试、`cargo clippy --workspace --all-targets -- -D warnings` 以及 GUI 启动验证均已通过。Wayland 捕获覆盖 registry/output 枚举、ext/wlr manager、SHM 单帧复制、ARGB/XRGB、stride、Y-invert/transform、cursor option、超时和取消；桌面窗口通过 worker 自动枚举/捕获输出。S2 代码链路也已接通：`CaptureFrame` 可映射为全屏 layer-shell 冻结帧，分数缩放由 `wp_viewporter` 处理，拖动时由无输入区域的 subsurface 绘制半透明遮罩/白色边框，Esc 取消，返回 `PixelRect` 后 UI 自动裁原图。当前自动化 bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实桌面像素和 Overlay 显示/输入仍必须分别通过 `scripts/validate-wayland.sh` 与 `scripts/validate-wayland-overlay.sh` 在宿主 Hyprland 会话最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后验收。
+在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试、`cargo clippy --workspace --all-targets -- -D warnings` 以及 GUI 启动验证均已通过。Wayland 捕获覆盖 registry/output 枚举、ext/wlr manager、SHM 单帧复制、ARGB/XRGB、stride、Y-invert/transform、cursor option、超时和取消；桌面窗口通过 worker 自动枚举/捕获输出。多屏 Wayland GUI 会在捕获前读取 LiSnap 窗口当前所在 monitor，并映射到稳定的 `wl_output` ID，只请求该输出；优先按输出名称匹配，必要时只在分辨率/scale 唯一时回退匹配，无法唯一确认时禁止捕获而不是退回第一块屏或全部输出。S2 代码链路也已接通：`CaptureFrame` 可映射为对应输出上的全屏 layer-shell 冻结帧，分数缩放由 `wp_viewporter` 处理，拖动时由无输入区域的 subsurface 绘制半透明遮罩/白色边框，Esc 取消，返回 `PixelRect` 后 UI 自动裁原图。当前自动化 bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实桌面像素、多屏目标选择和 Overlay 显示/输入仍必须在宿主 Hyprland 会话最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成；仓库已加入原生 GitHub Actions 构建矩阵，仍需等待远端实际运行后验收。
 
 ## 当前范围
 
-已实现 workspace、CLI、桌面窗口、后台输出枚举与 Capture/Cancel worker、输出选择、首帧静态预览、Linux/Wayland 原生单帧捕获、全屏冻结 Overlay/拖选/Esc 取消的代码链路、原图裁剪、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 捕获仍未实现；Wayland Overlay 的宿主真机验收、多输出/跨屏选区、标注、PNG 导出、剪贴板、全局快捷键和托盘仍待开发。
+已实现 workspace、CLI、桌面窗口、后台输出枚举与 Capture/Cancel worker、Linux/Wayland 多屏环境下跟随 LiSnap 窗口所在输出的单屏捕获、首帧静态预览、全屏冻结 Overlay/拖选/Esc 取消的代码链路、原图裁剪、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 捕获仍未实现；Wayland 多屏宿主真机验收、跨屏选区、标注、PNG 导出、剪贴板、全局快捷键和托盘仍待开发。
 
-下一步优先完成 **Wayland 捕获与冻结 Overlay 的宿主 Hyprland 真机验收**；通过后再扩展多输出/跨屏选区。不要把自动化环境中的编译/单测当成真实 compositor 验收。
+下一步优先完成 **Wayland 多屏下“窗口在哪块屏幕，截图就在哪块屏幕”以及冻结 Overlay 的宿主 Hyprland 真机验收**；通过后再扩展跨屏选区。不要把自动化环境中的编译/单测当成真实 compositor 验收。
