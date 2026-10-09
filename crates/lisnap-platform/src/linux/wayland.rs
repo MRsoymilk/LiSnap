@@ -90,7 +90,7 @@ pub enum WaylandOverlayOutcome {
 
 #[derive(Debug, Clone)]
 pub enum WaylandEditorOutcome {
-    Accepted { selection: PixelRect, image: lisnap_core::RgbaImage },
+    Accepted { selection: PixelRect, image: lisnap_core::RgbaImage, copy: bool },
     Cancelled,
     Closed,
 }
@@ -431,8 +431,8 @@ pub fn run_editor_socket(path: &Path, frame: &CaptureFrame) -> Result<WaylandEdi
 
 fn map_editor_outcome(outcome: overlay_runtime::EditorOverlayOutcome) -> Result<WaylandEditorOutcome, CaptureError> {
     Ok(match outcome {
-        overlay_runtime::EditorOverlayOutcome::Accepted { selection, image } => {
-            WaylandEditorOutcome::Accepted { selection, image }
+        overlay_runtime::EditorOverlayOutcome::Accepted { selection, image, copy } => {
+            WaylandEditorOutcome::Accepted { selection, image, copy }
         }
         overlay_runtime::EditorOverlayOutcome::Cancelled => WaylandEditorOutcome::Cancelled,
         overlay_runtime::EditorOverlayOutcome::Closed => WaylandEditorOutcome::Closed,

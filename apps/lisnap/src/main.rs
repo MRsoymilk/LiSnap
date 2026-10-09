@@ -102,18 +102,18 @@ fn run_interactive_capture(cli: &Cli) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     match outcome {
-        lisnap_platform::WaylandEditorOutcome::Accepted { selection, image } => {
-            let output = cli.output_path.as_deref().map(PathBuf::from).unwrap_or_else(default_output_path);
-            save_png(&output, &image)?;
-            println!(
-                "Saved {}x{} annotated capture from {} at {},{} to {}",
-                selection.width,
-                selection.height,
-                frame.screen.id,
-                selection.x,
-                selection.y,
-                output.display()
-            );
+        lisnap_platform::WaylandEditorOutcome::Accepted { selection, image, copy } => {
+            if copy {
+                copy_png_to_clipboard(&image)?;
+                println!("Copied {}x{} annotated capture from {} to clipboard", selection.width, selection.height, frame.screen.id);
+            } else {
+                let output = cli.output_path.as_deref().map(PathBuf::from).unwrap_or_else(default_output_path);
+                save_png(&output, &image)?;
+                println!(
+                    "Saved {}x{} annotated capture from {} at {},{} to {}",
+                    selection.width, selection.height, frame.screen.id, selection.x, selection.y, output.display()
+                );
+            }
             Ok(())
         }
         lisnap_platform::WaylandEditorOutcome::Cancelled => Ok(()),
@@ -192,6 +192,30 @@ fn json_string_field(input: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn copy_png_to_clipboard(image: &lisnap_core::RgbaImage) -> Result<(), String> {
+    use std::{io::Write, process::Stdio};
+    let size = image.size();
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, size.width, size.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| format!("PNG clipboard header failed: {e}"))?;
+        writer.write_image_data(image.pixels()).map_err(|e| format!("PNG clipboard encoding failed: {e}"))?;
+    }
+    let mut child = Command::new("wl-copy")
+        .args(["--type", "image/png"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("starting wl-copy failed: {e}; install gui-apps/wl-clipboard"))?;
+    child.stdin.take().ok_or("wl-copy has no stdin")?
+        .write_all(&png_bytes).map_err(|e| format!("sending PNG to clipboard failed: {e}"))?;
+    let status = child.wait().map_err(|e| format!("waiting for wl-copy failed: {e}"))?;
+    if !status.success() { return Err(format!("wl-copy exited with {status}")); }
+    Ok(())
 }
 
 fn default_output_path() -> PathBuf {

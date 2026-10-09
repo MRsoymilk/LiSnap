@@ -71,7 +71,7 @@ pub(crate) enum FrozenOverlayOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) enum EditorOverlayOutcome {
-    Accepted { selection: PixelRect, image: RgbaImage },
+    Accepted { selection: PixelRect, image: RgbaImage, copy: bool },
     Cancelled,
     Closed,
 }
@@ -79,7 +79,7 @@ pub(crate) enum EditorOverlayOutcome {
 #[derive(Debug, Clone)]
 enum RuntimeOutcome {
     Selected(PixelRect),
-    Accepted { selection: PixelRect, logical_size: PixelSize, annotations: Vec<Annotation> },
+    Accepted { selection: PixelRect, logical_size: PixelSize, annotations: Vec<Annotation>, copy: bool },
     Cancelled,
     Closed,
 }
@@ -689,9 +689,10 @@ pub(crate) fn run_editor_connection(
     frame: &CaptureFrame,
 ) -> Result<EditorOverlayOutcome, CaptureError> {
     match run_connection_mode(connection, frame, true)? {
-        RuntimeOutcome::Accepted { selection, logical_size, annotations } => Ok(EditorOverlayOutcome::Accepted {
+        RuntimeOutcome::Accepted { selection, logical_size, annotations, copy } => Ok(EditorOverlayOutcome::Accepted {
             selection,
             image: compose_annotated_crop(frame, logical_size, selection, &annotations)?,
+            copy,
         }),
         RuntimeOutcome::Cancelled => Ok(EditorOverlayOutcome::Cancelled),
         RuntimeOutcome::Closed => Ok(EditorOverlayOutcome::Closed),
@@ -1366,11 +1367,11 @@ fn redo_editor(state: &mut RuntimeState) {
     }
 }
 
-fn accept_editor(state: &mut RuntimeState) {
+fn accept_editor(state: &mut RuntimeState, copy: bool) {
     commit_text_draft(state);
     if let (Some(selection), Some(logical_size)) = (state.selection_pixels, state.logical_size) {
         state.outcome =
-            Some(RuntimeOutcome::Accepted { selection, logical_size, annotations: state.annotations.clone() });
+            Some(RuntimeOutcome::Accepted { selection, logical_size, annotations: state.annotations.clone(), copy });
     }
 }
 
@@ -1390,7 +1391,8 @@ fn handle_toolbar_action(state: &mut RuntimeState, action: ToolbarAction) {
         }
         ToolbarAction::Undo => undo_editor(state),
         ToolbarAction::Redo => redo_editor(state),
-        ToolbarAction::Confirm => accept_editor(state),
+        ToolbarAction::Confirm | ToolbarAction::Save => accept_editor(state, false),
+        ToolbarAction::Copy => accept_editor(state, true),
         ToolbarAction::Cancel => state.outcome = Some(RuntimeOutcome::Cancelled),
     }
 }
@@ -2044,7 +2046,7 @@ fn handle_editor_key(state: &mut RuntimeState, key: u32, pressed: bool, connecti
         19 => set_editor_tool(state, EditorTool::Rectangle, connection),
         30 => set_editor_tool(state, EditorTool::Arrow, connection),
         20 => set_editor_tool(state, EditorTool::Text, connection),
-        ENTER_KEY => accept_editor(state),
+        ENTER_KEY => accept_editor(state, false),
         _ => {}
     }
 }

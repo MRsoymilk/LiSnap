@@ -28,6 +28,8 @@ pub(crate) enum ToolbarAction {
     Tool(EditorTool),
     Undo,
     Redo,
+    Save,
+    Copy,
     Confirm,
     Cancel,
 }
@@ -560,7 +562,7 @@ const TOOLBAR_BUTTON: i32 = 40;
 const TOOLBAR_GAP: i32 = 6;
 const TOOLBAR_PAD: i32 = 8;
 const TOOLBAR_HEIGHT: i32 = TOOLBAR_BUTTON + TOOLBAR_PAD * 2;
-const TOOLBAR_COUNT: i32 = 10;
+const TOOLBAR_COUNT: i32 = 12;
 
 const TEXT_SELECTION_COLOR: [u8; 4] = [77, 139, 233, 185];
 const TOOLBAR_BG: [u8; 4] = [24, 27, 32, 232];
@@ -582,6 +584,8 @@ const TEXT_ICON: &str = include_str!("../../../../../res/icons/toolbar/text.svg"
 const MOSAIC_ICON: &str = include_str!("../../../../../res/icons/toolbar/mosaic.svg");
 const UNDO_ICON: &str = include_str!("../../../../../res/icons/toolbar/undo.svg");
 const REDO_ICON: &str = include_str!("../../../../../res/icons/toolbar/redo.svg");
+const SAVE_ICON: &str = include_str!("../../../../../res/icons/toolbar/save.svg");
+const COPY_ICON: &str = include_str!("../../../../../res/icons/toolbar/copy.svg");
 const CONFIRM_ICON: &str = include_str!("../../../../../res/icons/toolbar/confirm.svg");
 const CANCEL_ICON: &str = include_str!("../../../../../res/icons/toolbar/cancel.svg");
 
@@ -620,6 +624,8 @@ pub(crate) fn toolbar_layout(selection: RectI, screen: PixelSize) -> ToolbarLayo
         ToolbarAction::Tool(EditorTool::Mosaic),
         ToolbarAction::Undo,
         ToolbarAction::Redo,
+        ToolbarAction::Save,
+        ToolbarAction::Copy,
         ToolbarAction::Confirm,
         ToolbarAction::Cancel,
     ];
@@ -1379,6 +1385,8 @@ fn toolbar_icon(action: ToolbarAction) -> (&'static str, [u8; 4]) {
         ToolbarAction::Color => (PEN_ICON, TOOLBAR_ICON),
         ToolbarAction::Undo => (UNDO_ICON, TOOLBAR_ICON),
         ToolbarAction::Redo => (REDO_ICON, TOOLBAR_ICON),
+        ToolbarAction::Save => (SAVE_ICON, TOOLBAR_ICON),
+        ToolbarAction::Copy => (COPY_ICON, TOOLBAR_ICON),
         ToolbarAction::Confirm => (CONFIRM_ICON, TOOLBAR_CONFIRM),
         ToolbarAction::Cancel => (CANCEL_ICON, TOOLBAR_CANCEL),
     }
@@ -2018,6 +2026,8 @@ mod tests {
         assert!(layout.bounds.y >= 0);
         assert!(layout.bounds.x + layout.bounds.width <= 1920);
         assert!(layout.bounds.y + layout.bounds.height <= 1080);
+        assert!(layout.buttons.iter().any(|(action, _)| *action == ToolbarAction::Save));
+        assert!(layout.buttons.iter().any(|(action, _)| *action == ToolbarAction::Copy));
         let (_, first) = layout.buttons[1];
         assert_eq!(
             layout.hit_test((f64::from(first.x + 2), f64::from(first.y + 2))),
@@ -2036,6 +2046,8 @@ mod tests {
             ToolbarAction::Tool(EditorTool::Mosaic),
             ToolbarAction::Undo,
             ToolbarAction::Redo,
+            ToolbarAction::Save,
+            ToolbarAction::Copy,
             ToolbarAction::Confirm,
             ToolbarAction::Cancel,
         ];
