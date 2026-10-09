@@ -92,6 +92,7 @@ pub(crate) struct LiSnapApp {
 }
 
 impl LiSnapApp {
+    #[cfg(test)]
     pub(crate) fn new_with_overlay(
         selected: Option<BackendDescriptor>,
         backends: Vec<BackendDescriptor>,
@@ -99,11 +100,29 @@ impl LiSnapApp {
         screen_launcher: Option<ScreenLauncher>,
         overlay_launcher: Option<OverlayLauncher>,
     ) -> Self {
+        Self::new_with_overlay_and_cursor(
+            selected,
+            backends,
+            capture_launcher,
+            screen_launcher,
+            overlay_launcher,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_overlay_and_cursor(
+        selected: Option<BackendDescriptor>,
+        backends: Vec<BackendDescriptor>,
+        capture_launcher: Option<CaptureLauncher>,
+        screen_launcher: Option<ScreenLauncher>,
+        overlay_launcher: Option<OverlayLauncher>,
+        include_cursor: bool,
+    ) -> Self {
         let follow_window_output = selected.is_some_and(|backend| backend.id == "wayland");
         Self {
             selected,
             backends,
-            request: CaptureRequest::default(),
+            request: CaptureRequest { include_cursor, ..CaptureRequest::default() },
             capture_launcher,
             overlay_launcher,
             overlay_receiver: None,

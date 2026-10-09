@@ -13,13 +13,13 @@ LiSnap/
 ├── Cargo.toml                   # Workspace、版本、依赖与 lint 配置
 ├── apps/lisnap/src/              # 程序入口、CLI 参数和启动组合
 ├── crates/
-│   ├── lisnap-core/              # 截图类型、不可变 RGBA8 图像、裁剪、坐标换算
+│   ├── lisnap-core/              # 截图类型、不可变 RGBA8 图像、裁剪、坐标换算与持久化设置
 │   ├── lisnap-platform/src/
 │   │   ├── linux/wayland.rs      # Wayland 探测、捕获、layer-shell Overlay 入口
 │   │   ├── linux/x11.rs          # X11 的后续实现入口
 │   │   ├── windows/mod.rs        # Windows 原生后端入口
 │   │   └── macos/mod.rs          # macOS 原生后端入口
-│   └── lisnap-ui/                # egui/eframe 桌面窗口
+│   └── lisnap-ui/                # egui/eframe 诊断窗口与独立设置页
 ├── scripts/check-core.sh        # Unix 离线核心/CLI 检查
 ├── scripts/validate-wayland.sh  # 真实 Wayland 会话探测与帧捕获验收
 ├── scripts/validate-wayland-overlay.sh # 冻结 Overlay/拖选/裁剪宿主验收
@@ -37,6 +37,9 @@ LiSnap/
 cargo run -p lisnap
 cargo run -p lisnap -- --output ~/Pictures/LiSnap/manual.png
 cargo run -p lisnap -- --screen DP-1
+cargo run -p lisnap -- --settings
+cargo run -p lisnap -- --include-cursor
+cargo run -p lisnap -- --no-cursor
 cargo run -p lisnap -- --window
 cargo run -p lisnap -- --list-backends
 cargo run -p lisnap --no-default-features -- --list-backends
@@ -45,9 +48,9 @@ cargo run -p lisnap --no-default-features -- --probe-wayland
 cargo run -p lisnap --no-default-features -- --capture-wayland
 ```
 
-不带参数时直接进入交互式截图，不先打开普通主窗口。在 Hyprland 多屏环境中会读取当前活动 monitor，只捕获对应 `wl_output`；也可以用 `--screen OUTPUT` 显式指定。`--window` 保留原来的开发/诊断桌面窗口。`--output PATH` 指定确认后的 PNG 路径；未指定时保存到 `~/Pictures/LiSnap/`。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`，但当前交互式编辑器只实现 Wayland。
+不带参数时直接进入交互式截图，不先打开普通主窗口。在 Hyprland 多屏环境中会读取当前活动 monitor，只捕获对应 `wl_output`；也可以用 `--screen OUTPUT` 显式指定。`--settings`（也支持 `lisnap settings`）单独启动图形化设置页，不会先截图。设置页的 **Show mouse cursor in screenshots** 开关会立即保存，控制捕获图像是否包含鼠标指针，默认关闭。配置文件为 `$XDG_CONFIG_HOME/lisnap/config.toml`（未设置 XDG_CONFIG_HOME 时为 `~/.config/lisnap/config.toml`），内容示例：`[capture]` 下的 `include_cursor = true`。默认截图、Wayland 捕获诊断和 `--window` 诊断界面的初始值都会读取该配置；`--include-cursor` / `--no-cursor` 只覆盖当次截图，不改变配置。Wayland 的 `ext-image-copy-capture` 和 `wlr-screencopy` 均可向 compositor 请求包含/隐藏鼠标指针，实际效果取决于 compositor。`--window` 保留原来的开发/诊断桌面窗口。`--output PATH` 指定确认后的 PNG 路径；未指定时保存到 `~/Pictures/LiSnap/`。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`，但当前交互式编辑器只实现 Wayland。
 
-截图流程为：捕获当前输出 → 显示冻结画面 → 拖动选区 → 浮动工具条编辑 → 确认保存 PNG。工具条当前包含画笔、矩形、箭头、文字、Undo、Redo、确认和取消；快捷键支持 `P/R/A/T` 切换工具、`Ctrl+Z/Ctrl+Y` 撤销/重做、Enter 确认、Esc 取消。文字输入第一版支持英文、数字及常用 ASCII 符号；Wayland IME/中文输入尚未接入。
+截图流程为：捕获当前输出 → 显示冻结画面 → 拖动选区 → 浮动工具条编辑 → 确认保存 PNG。工具条最左侧是颜色选择（12 种预设颜色 + 自定义颜色），其后依次为画笔、矩形、箭头、文字、马赛克、Undo、Redo、确认和取消；快捷键支持 `P/R/A/T` 切换基本工具、`Ctrl+Z/Ctrl+Y` 撤销/重做、Enter 确认、Esc 取消。参考 Snipaste 的选中后再编辑交互：点击已有画笔、箭头、矩形、文字或马赛克，即可将其设为当前唯一选中对象，外边缘出现青色虚线选框；拖动对象或选框边缘可移动，点击其他对象切换选中，点击空白区域或按 Esc 取消选中。选中箭头时，首尾两端显示白色圆形控制点，可分别拖动起点或终点调整长度和方向；拖动箭头中段移动整支箭头。**双击已有文字**可重新编辑其内容（保留颜色、字号和原有层级），按 Enter 或点击其他位置提交，编辑时按 Esc 撤销本轮文字修改。修改文字后可继续选中并拖动。编辑器会把文字修改、删除及箭头调整记录到 `Ctrl+Z/Ctrl+Y` 历史中，外侧选框和端点控制点均为预览元素，不会导出到 PNG。马赛克工具拖动框选区域后以像素块替换原截图中对应区域，导出的 PNG 直接保存已遮挡的像素（不是可以通过隐藏图层恢复的非破坏性叠层）；这是像素化遮挡，并非密码学加密。Text 工具输入期间可按 `Ctrl+A` 全选当前文字（高亮），随后输入新内容或按 Backspace/Delete 替换/删除；`Ctrl+Z/Ctrl+Y` 优先撤销/重做当前文字的逐次编辑，退出文字输入后恢复标注级撤销/重做。右键工具栏上的画笔、矩形、箭头图标（或在选区内使用这些工具时右键），可以选择 1/2/3/5/8/12 px 线宽；右键文字工具则可选择 16/20/24/32/40/48 px 字号；右键马赛克工具可选择 8/12/18/24/32/48 px 方块大小。点击最左侧颜色块打开颜色面板，前 12 项为预设色，最后一项为 CUSTOM（自定义颜色）。点击 CUSTOM 后可在二维颜色矩形中单击或拖动取色：横向为饱和度（左白右纯色）、纵向为明度（上亮下黑），下方彩虹色相条可切换基色；选中位置有可见指示标记。仍可通过 R/G/B 三条滑轨或 HEX 输入框输入 6 位十六进制颜色（如 #2D8BC7），各种方式的数值互相同步。点击 APPLY 确认，BACK 或 Esc 返回预设面板。选色和 R/G/B 拖动时实时显示颜色预览，自定义色会以色块保留在 CUSTOM 项（当前截图编辑会话内）。新的选择用于后续画笔、矩形、箭头和文字，以及正在编辑的草稿，已完成的标注保留原颜色。选项菜单显示当前值，左键点选后关闭，也可点击外部或按 Esc 关闭；参数用于当前文字草稿和后续标注，已完成的标注保留原始线宽/字号。Wayland 文字工具已接入 `text-input-v3`，可接收 fcitx5 等输入法的预编辑/提交字符串；文字使用系统 fontconfig 中文字体渲染，也可通过 `LISNAP_FONT=/path/to/font.ttf` 指定字体。
 
 自动后端候选仍只依据操作系统及会话环境提示；真正捕获时会连接 Wayland registry 并按实际绑定能力选择 `ext-image-copy-capture` 或 `wlr-screencopy`。没有桌面会话、协议缺失、权限拒绝或帧约束不兼容时会明确失败，不伪造显示器信息。
 
@@ -98,6 +101,6 @@ LISNAP_SCREEN=DP-1 sh scripts/validate-wayland-overlay.sh
 
 ## 当前范围
 
-已实现 workspace、CLI、开发诊断窗口、Linux/Wayland 直接启动截图、Hyprland 活动输出定位、冻结 Overlay、拖选、浮动工具条、自由画笔、矩形、箭头、基础文字、撤销/重做、确认/取消、原图标注合成、PNG 导出、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 交互截图仍未实现；Wayland 宿主真机验收、中文/IME 文字输入、剪贴板、全局快捷键、托盘和跨屏选区仍待开发。
+已实现 workspace、CLI、开发诊断窗口、Linux/Wayland 直接启动截图、Hyprland 活动输出定位、冻结 Overlay、拖选、浮动工具条、自由画笔、矩形、箭头、Unicode/中文文字、Wayland text-input-v3 IME、撤销/重做、确认/取消、原图标注合成、PNG 导出、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 交互截图仍未实现；Wayland 宿主真机验收、剪贴板、全局快捷键、托盘和跨屏选区仍待开发。
 
-下一步优先完成 **Hyprland 多屏下直接启动截图 + 工具条标注的真机验收**，随后补中文/IME 与剪贴板。不要把自动化环境中的编译/单测当成真实 compositor 验收。
+下一步优先完成 **Hyprland 多屏下直接启动截图 + 工具条标注 + fcitx5 中文输入的真机验收**，随后补剪贴板。不要把自动化环境中的编译/单测当成真实 compositor 验收。

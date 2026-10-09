@@ -1,6 +1,7 @@
 mod cli;
 
 use cli::{Action, Cli};
+use lisnap_core::AppSettings;
 use lisnap_platform::{BackendKind, default_backend};
 use std::{
     fs::{self, File},
@@ -59,7 +60,15 @@ fn run(cli: Cli) -> Result<(), String> {
         Action::CaptureWayland => run_wayland_capture(&cli),
         Action::CaptureWlr => run_wlr_capture(&cli),
         Action::InteractiveCapture => run_interactive_capture(&cli),
-        Action::Window => launch_gui(cli.backend.or_else(default_backend)),
+        Action::Window => launch_gui(cli.backend.or_else(default_backend), AppSettings::load()?.include_cursor),
+        Action::Settings => launch_settings(),
+    }
+}
+
+fn effective_include_cursor(cli: &Cli) -> Result<bool, String> {
+    match cli.include_cursor {
+        Some(explicit) => Ok(explicit),
+        None => Ok(AppSettings::load()?.include_cursor),
     }
 }
 
@@ -75,7 +84,7 @@ fn run_interactive_capture(cli: &Cli) -> Result<(), String> {
     let screen_id = resolve_interactive_wayland_screen(cli)?;
     let request = lisnap_core::CaptureRequest {
         screen_id: Some(screen_id.clone()),
-        include_cursor: cli.include_cursor,
+        include_cursor: effective_include_cursor(cli)?,
         cancellation: None,
     };
     let frames = match cli.wayland_socket.as_deref() {
@@ -314,7 +323,7 @@ fn run_ext_constraint_probe(_cli: &Cli) -> Result<(), String> {
 fn run_wayland_capture(cli: &Cli) -> Result<(), String> {
     let request = lisnap_core::CaptureRequest {
         screen_id: cli.screen_id.clone(),
-        include_cursor: cli.include_cursor,
+        include_cursor: effective_include_cursor(cli)?,
         cancellation: None,
     };
     let probe = match cli.wayland_socket.as_deref() {
@@ -343,7 +352,7 @@ fn run_wayland_capture(_cli: &Cli) -> Result<(), String> {
 fn run_wlr_capture(cli: &Cli) -> Result<(), String> {
     let request = lisnap_core::CaptureRequest {
         screen_id: cli.screen_id.clone(),
-        include_cursor: cli.include_cursor,
+        include_cursor: effective_include_cursor(cli)?,
         cancellation: None,
     };
     let frames = match cli.wayland_socket.as_deref() {
@@ -392,7 +401,19 @@ fn protocol_version(version: Option<u32>) -> String {
 }
 
 #[cfg(feature = "gui")]
-fn launch_gui(kind: Option<BackendKind>) -> Result<(), String> {
+fn launch_settings() -> Result<(), String> {
+    let config_path = AppSettings::config_path()?;
+    let settings = AppSettings::load_from(&config_path)?;
+    lisnap_ui::run_settings(settings, config_path).map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "gui"))]
+fn launch_settings() -> Result<(), String> {
+    Err("settings window requires GUI support; rebuild with default features".into())
+}
+
+#[cfg(feature = "gui")]
+fn launch_gui(kind: Option<BackendKind>, include_cursor: bool) -> Result<(), String> {
     let selected = kind
         .map(lisnap_platform::create_backend)
         .transpose()
@@ -405,8 +426,15 @@ fn launch_gui(kind: Option<BackendKind>) -> Result<(), String> {
         _ => (None, None, None),
     };
     let backends = BackendKind::ALL.into_iter().map(BackendKind::descriptor).collect();
-    lisnap_ui::run_with_overlay(selected, backends, capture_launcher, screen_launcher, overlay_launcher)
-        .map_err(|error| error.to_string())
+    lisnap_ui::run_with_overlay_and_cursor(
+        selected,
+        backends,
+        capture_launcher,
+        screen_launcher,
+        overlay_launcher,
+        include_cursor,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "gui")]
@@ -465,13 +493,25 @@ fn make_overlay_launcher(_kind: BackendKind) -> Option<lisnap_ui::OverlayLaunche
 }
 
 #[cfg(not(feature = "gui"))]
-fn launch_gui(_kind: Option<BackendKind>) -> Result<(), String> {
+fn launch_gui(_kind: Option<BackendKind>, _include_cursor: bool) -> Result<(), String> {
     Err("GUI support is disabled; rebuild with default features, or use --list-backends".into())
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_cursor_override_takes_priority_over_persisted_settings() {
+        let show = Cli::parse(["--include-cursor".to_owned()]).unwrap();
+        let hide = Cli::parse(["--no-cursor".to_owned()]).unwrap();
+        assert!(effective_include_cursor(&show).unwrap());
+        assert!(!effective_include_cursor(&hide).unwrap());
+        let persisted = AppSettings { include_cursor: true };
+        assert!(persisted.include_cursor_with_override(None));
+        assert!(persisted.include_cursor_with_override(show.include_cursor));
+        assert!(!persisted.include_cursor_with_override(hide.include_cursor));
+    }
 
     #[test]
     fn parses_hyprland_active_monitor_name() {

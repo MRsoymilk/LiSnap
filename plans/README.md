@@ -36,8 +36,11 @@
 ## S3：基础截图工具
 
 - [x] PNG 导出：默认保存到 `~/Pictures/LiSnap/`，支持 `--output PATH`；确认时保存带标注的裁剪结果。
-- [x] 标注数据模型、自由画笔、矩形、箭头、基础 ASCII 文字、撤销/重做；支持 `P/R/A/T`、`Ctrl+Z/Ctrl+Y`、Enter、Esc。
-- [ ] Wayland text-input/IME 与中文文字渲染。
+- [x] `lisnap --settings` / `lisnap settings` 独立 eframe 设置页：截图是否包含鼠标指针（自动保存至 XDG `lisnap/config.toml`，默认为不显示），默认交互截图及 ext/wlr 捕获诊断读取配置，CLI `--include-cursor` 和 `--no-cursor` 可以临时覆盖，`--window` 读取保存的初始值。
+- [x] 标注数据模型、自由画笔、矩形、箭头、Unicode 文字、马赛克区域和颜色选择（12 种预设 + 自定义 HSV 二维取色矩形/色相条/RGB 滑条/6 位 HEX）；支持 `P/R/A/T`、`Ctrl+Z/Ctrl+Y`、Enter、Esc。
+- [x] 对标 Snipaste：已完成画笔/箭头/矩形/文字/马赛克支持单选中与重复编辑；选中对象外侧出现虚线框（不导出），箭头两端拖动控制点可调整方向和长度，拖动主体移动；双击历史文字可重新进入原内容编辑，保留原层级/颜色/字号并支持撤销/重做。单击空白处或按 Esc 取消选中，支持文字内容修改/删除以及图形位置调整的编辑历史；右键设置线宽、字号及马赛克块大小。
+- [ ] 宿主 Hyprland 验收：实际操作拖动移动、右键调参及马赛克预览/导出一致性。
+- [x] Wayland text-input-v3 / IME 与中文文字渲染：接收 preedit/commit/delete 事件，系统 fontconfig 选择中文字体，支持 `LISNAP_FONT` 覆盖。
 - [ ] 复制到剪贴板、全局快捷键和托盘。
 
 ## S4：其他平台和优化
