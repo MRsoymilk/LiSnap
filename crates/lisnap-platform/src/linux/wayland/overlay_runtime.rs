@@ -25,7 +25,10 @@ use wayland_client::{
         wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
-use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::wp::{
+    cursor_shape::v1::client::{wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1},
+    viewporter::client::{wp_viewport, wp_viewporter},
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 const WL_COMPOSITOR_MAX_VERSION: u32 = 6;
@@ -34,6 +37,7 @@ const WL_SEAT_MAX_VERSION: u32 = 9;
 const LAYER_SHELL_MAX_VERSION: u32 = 5;
 const LAYER_SHELL: &str = "zwlr_layer_shell_v1";
 const VIEWPORTER: &str = "wp_viewporter";
+const CURSOR_SHAPE_MANAGER_V1: &str = "wp_cursor_shape_manager_v1";
 const BTN_LEFT: u32 = 0x110;
 const ESC_KEY: u32 = 1;
 const BACKSPACE_KEY: u32 = 14;
@@ -127,6 +131,8 @@ struct RuntimeState {
     viewporter: Option<wp_viewporter::WpViewporter>,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
+    cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     outputs: BTreeMap<u32, OutputRecord>,
     sync_done: bool,
@@ -1018,6 +1024,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for RuntimeState {
             wl_registry::Event::Global { name, interface, version } if interface == VIEWPORTER => {
                 state.viewporter = Some(registry.bind(name, version.min(1), queue_handle, ()));
             }
+            wl_registry::Event::Global { name, interface, version } if interface == CURSOR_SHAPE_MANAGER_V1 => {
+                state.cursor_shape_manager = Some(registry.bind(name, version.min(1), queue_handle, ()));
+            }
             wl_registry::Event::Global { name, interface, version } if interface == "wl_seat" => {
                 if state.seat.is_none() {
                     state.seat = Some(registry.bind(name, version.min(WL_SEAT_MAX_VERSION), queue_handle, ()));
@@ -1143,13 +1152,25 @@ impl Dispatch<wl_seat::WlSeat, ()> for RuntimeState {
     ) {
         if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(capabilities) } = event {
             if capabilities.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-                state.pointer = Some(seat.get_pointer(queue_handle, ()));
+                let pointer = seat.get_pointer(queue_handle, ());
+                if let Some(manager) = state.cursor_shape_manager.as_ref() {
+                    state.cursor_shape_device = Some(manager.get_pointer(&pointer, queue_handle, ()));
+                }
+                state.pointer = Some(pointer);
             }
             if capabilities.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
                 state.keyboard = Some(seat.get_keyboard(queue_handle, ()));
             }
         }
     }
+}
+
+impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for RuntimeState {
+    fn event(_: &mut Self, _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, _: wp_cursor_shape_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for RuntimeState {
+    fn event(_: &mut Self, _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, _: wp_cursor_shape_device_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
@@ -1161,6 +1182,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+        if let wl_pointer::Event::Enter { serial, .. } = &event {
+            if let Some(device) = state.cursor_shape_device.as_ref() {
+                device.set_shape(*serial, wp_cursor_shape_device_v1::Shape::Default);
+            }
+        }
         match event {
             wl_pointer::Event::Enter { surface_x, surface_y, .. }
             | wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
