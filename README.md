@@ -1,106 +1,174 @@
-# LiSnap
+<!-- LiSnap | Primary language: 简体中文 -->
+<p align="center">
+  <img src="docs/images/logo.png" alt="LiSnap logo" width="136" />
+</p>
 
-使用 Rust 开发的跨平台截屏工具。当前版本 `0.1.0`，不依赖 Qt。
+<h1 align="center">LiSnap</h1>
 
-Linux/Wayland 已实现直接启动截图的交互链路：优先使用 `ext-image-copy-capture`，不可用时回退 `wlr-screencopy`；冻结屏幕与选区编辑使用 `zwlr_layer_shell_v1`、SHM、`wp_viewporter` 和 `wl_subcompositor`，不经过 Portal。完成选区后显示浮动工具条，可使用自由画笔、矩形、箭头、文字、撤销/重做、确认/取消；确认后输出带标注的 PNG。X11、Windows、macOS 仍是明确失败的占位实现。Wayland 编辑器仍需在宿主 Hyprland 多屏会话完成真机验收。
+<p align="center">
+  <strong>轻快、原生、可标注的截图工具</strong><br />
+  面向 Linux / Wayland，使用 Rust 构建。
+</p>
 
-## 技术结构
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
 
-核心和平台接口仅依赖 Rust 标准库。桌面界面使用 egui/eframe，渲染使用 wgpu；Linux 截图计划直接接入 Wayland 协议，不提供 Portal 截图后端。Windows、macOS、X11 的原生实现分别隔离在平台模块中。
+<p align="center">
+  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-2563eb" />
+  <img alt="Rust 1.97+" src="https://img.shields.io/badge/Rust-1.97%2B-f97316" />
+  <img alt="Linux Wayland" src="https://img.shields.io/badge/Linux-Wayland-0891b2" />
+  <img alt="Development status: Alpha" src="https://img.shields.io/badge/status-alpha-64748b" />
+</p>
 
-```text
-LiSnap/
-├── Cargo.toml                   # Workspace、版本、依赖与 lint 配置
-├── apps/lisnap/src/              # 程序入口、CLI 参数和启动组合
-├── crates/
-│   ├── lisnap-core/              # 截图类型、不可变 RGBA8 图像、裁剪、坐标换算与持久化设置
-│   ├── lisnap-platform/src/
-│   │   ├── linux/wayland.rs      # Wayland 探测、捕获、layer-shell Overlay 入口
-│   │   ├── linux/x11.rs          # X11 的后续实现入口
-│   │   ├── windows/mod.rs        # Windows 原生后端入口
-│   │   └── macos/mod.rs          # macOS 原生后端入口
-│   └── lisnap-ui/                # egui/eframe 诊断窗口与独立设置页
-├── scripts/check-core.sh        # Unix 离线核心/CLI 检查
-├── scripts/validate-wayland.sh  # 真实 Wayland 会话探测与帧捕获验收
-├── scripts/validate-wayland-overlay.sh # 冻结 Overlay/拖选/裁剪宿主验收
-├── docs/architecture.md          # 边界、坐标和捕获约定
-└── plans/README.md               # 分阶段开发顺序
+LiSnap 是一个正在开发中的桌面截图与标注工具：**截取屏幕 → 框选区域 → 直接标注 → 保存 PNG 或复制图片**。当前可用的交互式截图后端为 **Linux / Wayland**，优先使用 `ext-image-copy-capture`，不支持时尝试 `wlr-screencopy`；不经由截图 Portal。X11、Windows 和 macOS 原生后端仍在规划中，不应视为已支持。
+
+## 界面预览
+
+### 选区与标注
+
+![LiSnap 截图编辑器界面预览：选区、标注与底部工具栏](docs/images/editor-preview.jpg)
+
+### 颜色面板
+
+![LiSnap 颜色面板界面预览](docs/images/palette-preview.jpg)
+
+> **预览说明：** 以上图片中的工具栏、标注和颜色面板由 **LiSnap 当前 Rust 原生绘制代码离屏渲染**，背景为演示场景，**不是 Hyprland 实机截图**。当前自动化执行环境无法连接宿主 Wayland socket。真实桌面截图仍需在 Hyprland 会话中采集与验收；参见[实机截图与验证](#实机截图与验证)。
+
+## 功能亮点
+
+- **原生 Wayland 截图：** 自动定位 Hyprland 活动显示器，也可通过 `--screen` 指定输出；捕获后显示冻结画面和可拖动的矩形选区。
+- **就地标注：** 画笔、矩形、箭头、文字和马赛克；支持移动已有标注、调节箭头端点、双击重新编辑文字，以及撤销/重做。
+- **灵活的绘图样式：** 12 种预设颜色、自定义 HSV 取色、RGB/HEX 输入；线宽、文字大小和马赛克块尺寸可调。
+- **保存与复制分离：** 保存/确认输出已合成标注的 PNG；复制通过 `wl-copy` 将 PNG 放入 Wayland 剪贴板，不额外写入图片文件。
+- **鼠标与文字输入：** 截图默认不包含鼠标指针，但截图界面中的鼠标仍正常显示和操作；支持 Unicode 文字与 Wayland `text-input-v3` 输入法交互（具体取决于 compositor / IME）。
+
+> LiSnap 仍处于 **Alpha 阶段**：协议探测、数据处理和编辑器已有自动化验证，但多显示器、实际剪贴板粘贴及输入法行为仍需要在宿主 Hyprland 会话中验收。
+
+## 平台支持
+
+| 平台 | 当前状态 | 说明 |
+| --- | --- | --- |
+| Linux / Wayland | **已实现，待完整实机验收** | 面向提供所需截图协议与 layer-shell 能力的 compositor，优先 Hyprland |
+| Linux / X11 | 规划中 | 当前仅占位后端 |
+| Windows | 规划中 | 尚无可用原生截图实现 |
+| macOS | 规划中 | 尚无可用原生截图实现 |
+
+## 快速开始
+
+**前提条件：** Rust / Cargo **1.97+**、受支持的 Linux Wayland 会话，以及能够访问 `ext-image-copy-capture` 或 `wlr-screencopy` 的 compositor。复制图片需要系统安装 `wl-copy`（来自 `wl-clipboard`）。Gentoo 可使用：
+
+```bash
+emerge -av gui-apps/wl-clipboard
 ```
 
-## 构建与启动
+克隆并启动：
 
-工具链要求：Rust/Cargo 1.97 或更新版本。没有写入 rust-toolchain 文件，不会替换本机工具链。首次 Cargo 解析需要访问依赖仓库；GUI 运行还需要可用的桌面会话和图形后端。
-
-依赖可用后的常规命令：
-
-```sh
+```bash
+git clone https://github.com/MRsoymilk/LiSnap.git
+cd LiSnap
 cargo run -p lisnap
-cargo run -p lisnap -- --output ~/Pictures/LiSnap/manual.png
-cargo run -p lisnap -- --screen DP-1
-cargo run -p lisnap -- --settings
-cargo run -p lisnap -- --include-cursor
-cargo run -p lisnap -- --no-cursor
-cargo run -p lisnap -- --window
-cargo run -p lisnap -- --list-backends
-cargo run -p lisnap --no-default-features -- --list-backends
-cargo run -p lisnap --no-default-features -- --list-screens
-cargo run -p lisnap --no-default-features -- --probe-wayland
-cargo run -p lisnap --no-default-features -- --capture-wayland
 ```
 
-不带参数时直接进入交互式截图，不先打开普通主窗口。在 Hyprland 多屏环境中会读取当前活动 monitor，只捕获对应 `wl_output`；也可以用 `--screen OUTPUT` 显式指定。`--settings`（也支持 `lisnap settings`）单独启动图形化设置页，不会先截图。设置页的 **Show mouse cursor in screenshots** 开关会立即保存，控制捕获图像是否包含鼠标指针，默认关闭。配置文件为 `$XDG_CONFIG_HOME/lisnap/config.toml`（未设置 XDG_CONFIG_HOME 时为 `~/.config/lisnap/config.toml`），内容示例：`[capture]` 下的 `include_cursor = true`。默认截图、Wayland 捕获诊断和 `--window` 诊断界面的初始值都会读取该配置；`--include-cursor` / `--no-cursor` 只覆盖当次截图，不改变配置。Wayland 的 `ext-image-copy-capture` 和 `wlr-screencopy` 均可向 compositor 请求包含/隐藏鼠标指针，实际效果取决于 compositor。`--window` 保留原来的开发/诊断桌面窗口。`--output PATH` 指定确认后的 PNG 路径；未指定时保存到 `~/Pictures/LiSnap/`。`--backend` 接受 `auto`、`wayland`、`x11`、`windows`、`macos`，但当前交互式编辑器只实现 Wayland。
+不带参数时**直接进入交互式截图**，不会先打开普通主窗口。框选后即可标注，并使用底部保存、复制、确认或取消按钮。默认保存路径为 `~/Pictures/LiSnap/`。
 
-截图流程为：捕获当前输出 → 显示冻结画面 → 拖动选区 → 浮动工具条编辑 → 确认保存 PNG。工具条最左侧是颜色选择（12 种预设颜色 + 自定义颜色），其后依次为画笔、矩形、箭头、文字、马赛克、Undo、Redo、保存、复制、确认和取消；保存将带标注选区写入 PNG，复制则通过 `wl-copy --type image/png` 将同一张 PNG 放入 Wayland 剪贴板而不写文件（Gentoo 需安装 `gui-apps/wl-clipboard`）；快捷键支持 `P/R/A/T` 切换基本工具、`Ctrl+Z/Ctrl+Y` 撤销/重做、Enter 确认、Esc 取消。参考 Snipaste 的选中后再编辑交互：点击已有画笔、箭头、矩形、文字或马赛克，即可将其设为当前唯一选中对象，外边缘出现青色虚线选框；拖动对象或选框边缘可移动，点击其他对象切换选中，点击空白区域或按 Esc 取消选中。选中箭头时，首尾两端显示白色圆形控制点，可分别拖动起点或终点调整长度和方向；拖动箭头中段移动整支箭头。**双击已有文字**可重新编辑其内容（保留颜色、字号和原有层级），按 Enter 或点击其他位置提交，编辑时按 Esc 撤销本轮文字修改。修改文字后可继续选中并拖动。编辑器会把文字修改、删除及箭头调整记录到 `Ctrl+Z/Ctrl+Y` 历史中，外侧选框和端点控制点均为预览元素，不会导出到 PNG。马赛克工具拖动框选区域后以像素块替换原截图中对应区域，导出的 PNG 直接保存已遮挡的像素（不是可以通过隐藏图层恢复的非破坏性叠层）；这是像素化遮挡，并非密码学加密。Text 工具输入期间可按 `Ctrl+A` 全选当前文字（高亮），随后输入新内容或按 Backspace/Delete 替换/删除；`Ctrl+Z/Ctrl+Y` 优先撤销/重做当前文字的逐次编辑，退出文字输入后恢复标注级撤销/重做。右键工具栏上的画笔、矩形、箭头图标（或在选区内使用这些工具时右键），可以选择 1/2/3/5/8/12 px 线宽；右键文字工具则可选择 16/20/24/32/40/48 px 字号；右键马赛克工具可选择 8/12/18/24/32/48 px 方块大小。点击最左侧颜色块打开颜色面板，前 12 项为预设色，最后一项为 CUSTOM（自定义颜色）。点击 CUSTOM 后可在二维颜色矩形中单击或拖动取色：横向为饱和度（左白右纯色）、纵向为明度（上亮下黑），下方彩虹色相条可切换基色；选中位置有可见指示标记。仍可通过 R/G/B 三条滑轨或 HEX 输入框输入 6 位十六进制颜色（如 #2D8BC7），各种方式的数值互相同步。点击 APPLY 确认，BACK 或 Esc 返回预设面板。选色和 R/G/B 拖动时实时显示颜色预览，自定义色会以色块保留在 CUSTOM 项（当前截图编辑会话内）。新的选择用于后续画笔、矩形、箭头和文字，以及正在编辑的草稿，已完成的标注保留原颜色。选项菜单显示当前值，左键点选后关闭，也可点击外部或按 Esc 关闭；参数用于当前文字草稿和后续标注，已完成的标注保留原始线宽/字号。Wayland 文字工具已接入 `text-input-v3`，可接收 fcitx5 等输入法的预编辑/提交字符串；文字使用系统 fontconfig 中文字体渲染，也可通过 `LISNAP_FONT=/path/to/font.ttf` 指定字体。
+常用命令：
 
-自动后端候选仍只依据操作系统及会话环境提示；真正捕获时会连接 Wayland registry 并按实际绑定能力选择 `ext-image-copy-capture` 或 `wlr-screencopy`。没有桌面会话、协议缺失、权限拒绝或帧约束不兼容时会明确失败，不伪造显示器信息。
+```bash
+# 交互式截图
+cargo run -p lisnap
 
-## 验证
+# 保存到指定 PNG 文件
+cargo run -p lisnap -- --output ~/Pictures/LiSnap/example.png
 
-常规 Cargo 验证：
+# 指定显示器（例如 DP-1）
+cargo run -p lisnap -- --screen DP-1
 
-```sh
+# 独立打开设置窗口
+cargo run -p lisnap -- --settings
+
+# 仅覆盖当前捕获的鼠标指针设置
+cargo run -p lisnap -- --no-cursor
+cargo run -p lisnap -- --include-cursor
+
+# 查看后端、探测 Wayland 协议
+cargo run -p lisnap -- --list-backends
+cargo run -p lisnap -- --probe-wayland
+
+# 打开开发/诊断界面（不是正常截图入口）
+cargo run -p lisnap -- --window
+```
+
+更多参数使用 `cargo run -p lisnap -- --help`。
+
+## 编辑操作
+
+| 操作 | 交互方式 |
+| --- | --- |
+| 框选区域 | 在冻结画面上按住鼠标左键拖动 |
+| 画笔 / 矩形 / 箭头 / 文字 | 工具栏按钮，或快捷键 `P` / `R` / `A` / `T` |
+| 马赛克 | 选择工具栏中的马赛克图标，拖动框选遮挡区域 |
+| 编辑已有对象 | 单击选中并拖动；箭头可拖动首尾控制点；双击已有文字重新输入 |
+| 更改样式 | 左侧颜色按钮；右键工具按钮设置线宽、字号或马赛克尺寸 |
+| 撤销 / 重做 | `Ctrl+Z` / `Ctrl+Y` |
+| 保存 PNG | 点击保存或确认（`Enter`）；`--output` 可指定输出文件 |
+| 复制到剪贴板 | 点击复制图标；需要 `wl-copy` |
+| 取消 | 点击取消，或使用 `Esc`（输入/对象选中状态下可能先取消当前操作） |
+
+文字输入期间支持 `Ctrl+A` 全选及逐次撤销/重做；中文输入使用系统字体与 compositor 提供的 `text-input-v3` 协议。马赛克对输出像素进行直接像素化处理，**并非加密**。
+
+## 设置
+
+运行 `cargo run -p lisnap -- --settings` 可调整并自动保存截图是否包含鼠标指针。默认关闭，对应配置：
+
+```toml
+# ~/.config/lisnap/config.toml
+[capture]
+include_cursor = false
+```
+
+如果配置了 `XDG_CONFIG_HOME`，文件位于 `$XDG_CONFIG_HOME/lisnap/config.toml`。命令行 `--include-cursor` / `--no-cursor` 仅影响本次捕获，不会修改已保存的设置。
+
+## 实机截图与验证
+
+目前提交的是**原生绘制器界面预览**。要补充或替换为实际桌面截图，请在可运行 LiSnap 的 Hyprland 会话中完成选区并打开标注工具栏，再从另一个终端采集显示器，例如：
+
+```bash
+# 在有权限访问同一 Wayland 会话的终端执行
+grim -o DP-1 docs/images/editor-real.png
+```
+
+随后在确认图片不包含隐私信息后，将真实截图加入仓库并替换上方的预览引用。输出名称可通过本机 `hyprctl monitors` 查询。
+
+构建、测试和代码检查：
+
+```bash
 cargo fmt --all -- --check
-cargo test -p lisnap-core -p lisnap-platform -p lisnap --no-default-features
 cargo check --workspace --all-targets
+cargo test -p lisnap-core -p lisnap-platform -p lisnap --no-default-features
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Cargo 的 workspace 依赖解析仍可能访问可选 GUI 依赖的索引；`--no-default-features` 不是首次构建完全离线的保证。网络不可用时，可以直接验证没有第三方依赖的核心部分：
+需要真实 Wayland socket 的捕获/冻结选区测试，应在宿主会话执行：
 
-```sh
-sh scripts/check-core.sh
-./target/standalone-check/lisnap --list-backends
-```
-
-该脚本通过 rustc 编译核心库、平台库和无 GUI CLI 的离线子集，开启 `-D warnings` 和 `-D unsafe_code`。产物位于 `target/standalone-check/`。它不验证 Wayland 第三方协议依赖、eframe/wgpu、Cargo 特性解析或其他操作系统的原生实现，不可替代完整 Cargo 检查。
-
-真实 Wayland 捕获必须在能够访问 compositor socket 的桌面会话中验证：
-
-```sh
+```bash
 sh scripts/validate-wayland.sh
-# 指定输出时：
-LISNAP_SCREEN=DP-1 sh scripts/validate-wayland.sh
-# 服务/容器环境可显式指定 socket：
-LISNAP_WAYLAND_SOCKET=/run/user/1000/wayland-1 sh scripts/validate-wayland.sh
-```
-
-脚本先执行 `--probe-wayland`，随后执行 `--capture-wayland`。成功时输出每个捕获帧的输出 ID、像素尺寸、RGBA 字节数和 FNV64 校验和；它不打开截图选择 UI，也不会写入截图文件。
-
-全屏冻结选区可独立验收，不依赖主 GUI：
-
-```sh
 sh scripts/validate-wayland-overlay.sh
-LISNAP_SCREEN=DP-1 sh scripts/validate-wayland-overlay.sh
 ```
 
-该脚本调用 `lisnap-platform` 的 `wayland-overlay` example：先 headless 捕获目标输出，再显示冻结 layer-shell Overlay；左键拖拽确认选区、Esc 取消。确认后会对原始 `RgbaImage` 执行裁剪并输出选区坐标、尺寸、RGBA 字节数和 FNV64。
+## 项目结构
 
-### 当前验证结果
+| 目录 | 职责 |
+| --- | --- |
+| `apps/lisnap` | 命令行入口、截图流程和 PNG 输出 / 剪贴板复制 |
+| `crates/lisnap-core` | 图像、选区、捕获请求与设置数据模型 |
+| `crates/lisnap-platform` | 原生后端、Wayland 捕获与原生覆盖层 / 标注绘制 |
+| `crates/lisnap-ui` | egui/eframe 设置页及开发诊断界面 |
+| `docs/architecture.md` | 架构边界、坐标处理与捕获协议说明 |
+| `scripts/` | 离线构建和 Wayland 宿主验证脚本 |
 
-在本机 Linux / rustc 1.97.1 上，完整 workspace `cargo check --all-targets`、平台/CLI/UI 测试以及 `cargo clippy --workspace --all-targets -- -D warnings` 均已通过。Wayland 捕获覆盖 registry/output 枚举、ext/wlr manager、SHM 单帧复制、ARGB/XRGB、stride、Y-invert/transform、cursor option、超时和取消；交互编辑器已覆盖选区、工具条布局/命中、CPU 标注合成、PNG 输出入口和 Hyprland monitor 字段解析。冻结帧与工具条使用原生 layer-shell/subsurface，标注采用双 SHM buffer 更新，最终直接合成到原始捕获像素后裁剪输出。当前 EndlessVibe bubblewrap 没有挂载宿主 `/run/user/1000/wayland-*`，因此真实多屏目标选择、工具条显示、鼠标/键盘输入与保存结果仍必须在宿主 Hyprland 会话最终验收。Windows/macOS 本地交叉检查因对应 Rust target 未安装而无法完成。
+## 后续计划
 
-## 当前范围
+优先完善 **Hyprland 实机验收、多屏与不同缩放场景、剪贴板及输入法兼容性**；后续再考虑全局快捷键、托盘、跨屏选区以及 X11 / Windows / macOS 原生实现。
 
-已实现 workspace、CLI、开发诊断窗口、Linux/Wayland 直接启动截图、Hyprland 活动输出定位、冻结 Overlay、拖选、浮动工具条、自由画笔、矩形、箭头、Unicode/中文文字、Wayland text-input-v3 IME、撤销/重做、确认/取消、原图标注合成、PNG 导出、负坐标/分数缩放选区换算及基础测试。X11、Windows、macOS 交互截图仍未实现；Wayland 宿主真机验收、剪贴板、全局快捷键、托盘和跨屏选区仍待开发。
-
-下一步优先完成 **Hyprland 多屏下直接启动截图 + 工具条标注 + fcitx5 中文输入的真机验收**，随后补剪贴板。不要把自动化环境中的编译/单测当成真实 compositor 验收。
+欢迎通过 [GitHub Issues](https://github.com/MRsoymilk/LiSnap/issues) 反馈问题或建议。架构细节见 [docs/architecture.md](docs/architecture.md)。
