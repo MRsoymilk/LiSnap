@@ -3,6 +3,7 @@ mod annotation;
 mod ext;
 mod overlay;
 mod overlay_runtime;
+mod selection;
 mod shm;
 mod wlr;
 

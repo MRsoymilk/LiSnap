@@ -48,8 +48,15 @@ pub fn selection_to_pixels(selection: LogicalRect, output: LogicalRect, pixels: 
     if left >= right || top >= bottom {
         return None;
     }
-    let x = |edge: f64| (edge - output.x) / output.width * f64::from(pixels.width);
-    let y = |edge: f64| (edge - output.y) / output.height * f64::from(pixels.height);
+    // Multiply before dividing so exact pixel boundaries (e.g. 280 * 750 / 500)
+    // do not gain a spurious pixel from rounding a normalized fraction first.
+    let scale_edge = |edge: f64, origin: f64, extent: f64, pixels: u32| {
+        let offset = edge - origin;
+        let numerator = offset * f64::from(pixels);
+        if numerator.is_finite() { numerator / extent } else { offset / extent * f64::from(pixels) }
+    };
+    let x = |edge: f64| scale_edge(edge, output.x, output.width, pixels.width);
+    let y = |edge: f64| scale_edge(edge, output.y, output.height, pixels.height);
     let x0 = x(left).floor().clamp(0.0, f64::from(pixels.width)) as u32;
     let y0 = y(top).floor().clamp(0.0, f64::from(pixels.height)) as u32;
     let x1 = x(right).ceil().clamp(0.0, f64::from(pixels.width)) as u32;

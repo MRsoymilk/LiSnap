@@ -107,6 +107,7 @@ For the complete CLI reference, run `cargo run -p lisnap -- --help`.
 | Action | How to use |
 | --- | --- |
 | Select a region | Drag with the left mouse button over the frozen screen |
+| Resize selection | Drag any edge or one of eight handles after selecting; `Esc` cancels the resize, `Ctrl+Z` / `Ctrl+Y` undo/redo it. Existing annotations are retained and clipped to the new region |
 | Pen / Rectangle / Arrow / Text | Toolbar buttons or `P` / `R` / `A` / `T` |
 | Mosaic | Select the mosaic tool and drag across a region |
 | Modify annotations | Click to select and drag; resize arrows by dragging endpoints; double-click text to edit |
