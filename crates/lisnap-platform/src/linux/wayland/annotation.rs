@@ -198,6 +198,32 @@ impl ContextMenu {
 
 // Menu backing stores the largest popup. Ordinary popups keep their compact dimensions.
 pub(crate) const CONTEXT_MENU_SIZE: PixelSize = PixelSize { width: 244, height: 440 };
+// Enough for two u32 dimensions, a separator and the pixel unit at bitmap scale 2.
+pub(crate) const SELECTION_DIMENSIONS_SIZE: PixelSize = PixelSize { width: 332, height: 30 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectionDimensions {
+    pub(crate) bounds: RectI,
+    pub(crate) text: String,
+}
+
+pub(crate) fn selection_dimensions_layout(
+    selection: RectI,
+    pixels: PixelRect,
+    screen: PixelSize,
+) -> SelectionDimensions {
+    let text = format!("{} × {} px", pixels.width, pixels.height);
+    let screen_width = i32::try_from(screen.width).unwrap_or(i32::MAX);
+    let screen_height = i32::try_from(screen.height).unwrap_or(i32::MAX);
+    let width = (text.chars().count() as i32 * 12 + 20).min(screen_width);
+    let height = (SELECTION_DIMENSIONS_SIZE.height as i32).min(screen_height);
+    let x = selection.x.clamp(0, (screen_width - width).max(0));
+    // Prefer the space above the selection; at the screen's top edge, move inside.
+    let y = if selection.y >= height + 6 { selection.y - height - 6 } else { selection.y + 6 };
+    let y = y.clamp(0, (screen_height - height).max(0));
+    SelectionDimensions { bounds: RectI { x, y, width, height }, text }
+}
+
 const SV_WIDTH: usize = 216;
 const SV_HEIGHT: usize = 128;
 const HUE_STRIP_WIDTH: usize = 216;
@@ -726,6 +752,14 @@ pub(crate) fn render_toolbar_patch_with_color(toolbar: &ToolbarLayout, tool: Edi
     let mut raster = patch_raster(toolbar.bounds);
     raster.clip = None;
     draw_toolbar(&mut raster, toolbar, tool, color);
+    finish_patch(raster)
+}
+
+pub(crate) fn render_selection_dimensions_patch(dimensions: &SelectionDimensions) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..dimensions.bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, TOOLBAR_BG);
+    raster.draw_text_bitmap((10, 8), &dimensions.text, 2, TOOLBAR_ICON);
     finish_patch(raster)
 }
 
@@ -1974,7 +2008,7 @@ fn glyph5x7(ch: char) -> [u8; 7] {
         'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
         'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'X' | '×' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
         'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
         'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
         '0' => [0b01110, 0b10011, 0b10101, 0b10101, 0b11001, 0b10001, 0b01110],
@@ -2017,6 +2051,56 @@ mod tests {
     use super::*;
     use lisnap_core::ScreenInfo;
     use std::time::SystemTime;
+
+    #[test]
+    fn selection_dimensions_prefer_selection_top_left_and_stay_on_screen() {
+        let screen = PixelSize { width: 1920, height: 1080 };
+        let pixels = PixelRect { x: 0, y: 0, width: 800, height: 400 };
+        let dimensions = selection_dimensions_layout(RectI { x: 100, y: 100, width: 400, height: 200 }, pixels, screen);
+        assert_eq!(dimensions.text, "800 × 400 px");
+        assert_eq!(dimensions.bounds.x, 100);
+        assert_eq!(dimensions.bounds.y, 64);
+        for selection in [
+            RectI { x: 0, y: 0, width: 1920, height: 1080 },
+            RectI { x: 1900, y: 0, width: 20, height: 20 },
+            RectI { x: 1900, y: 1060, width: 20, height: 20 },
+        ] {
+            let bounds = selection_dimensions_layout(selection, pixels, screen).bounds;
+            assert!(bounds.x >= 0 && bounds.y >= 0);
+            assert!(bounds.x + bounds.width <= screen.width as i32);
+            assert!(bounds.y + bounds.height <= screen.height as i32);
+            if selection.y == 0 {
+                assert_eq!(bounds.y, 6);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_dimensions_fit_backing_and_render_text_without_system_font() {
+        let dimensions = selection_dimensions_layout(
+            RectI { x: 100, y: 100, width: 400, height: 200 },
+            PixelRect { x: 0, y: 0, width: u32::MAX, height: u32::MAX },
+            PixelSize { width: 1920, height: 1080 },
+        );
+        assert!(dimensions.bounds.width <= SELECTION_DIMENSIONS_SIZE.width as i32);
+        assert!(dimensions.bounds.height <= SELECTION_DIMENSIONS_SIZE.height as i32);
+        let patch = render_selection_dimensions_patch(&dimensions);
+        assert_eq!(patch.len(), dimensions.bounds.width as usize * dimensions.bounds.height as usize * 4);
+        assert!(patch.chunks_exact(4).any(|pixel| pixel[3] == 255));
+        assert!(patch.chunks_exact(4).any(|pixel| pixel[3] == TOOLBAR_BG[3]));
+        assert_eq!(glyph5x7('×'), glyph5x7('X'));
+    }
+
+    #[test]
+    fn selection_dimensions_clamp_on_tiny_screens() {
+        let dimensions = selection_dimensions_layout(
+            RectI { x: 5, y: 5, width: 5, height: 5 },
+            PixelRect { x: 5, y: 5, width: 5, height: 5 },
+            PixelSize { width: 10, height: 10 },
+        );
+        assert_eq!(dimensions.bounds, RectI { x: 0, y: 0, width: 10, height: 10 });
+        assert_eq!(render_selection_dimensions_patch(&dimensions).len(), 10 * 10 * 4);
+    }
 
     #[test]
     fn toolbar_stays_on_screen_and_hits_buttons() {

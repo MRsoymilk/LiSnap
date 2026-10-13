@@ -12,12 +12,13 @@ use lisnap_core::{CaptureError, CaptureFrame, LogicalRect, PixelRect, PixelSize,
 use super::annotation::{
     Annotation, ArrowHandle, CONTEXT_MENU_SIZE, CUSTOM_DRAG_HUE, CUSTOM_DRAG_SV, CUSTOM_HUE_ID, CUSTOM_SV_ID,
     ContextMenu, ContextMenuKind, CustomColorEditor, DEFAULT_COLOR, DraftAnnotation, EditorTool, MosaicSource, PALETTE,
-    RectI as AnnotationRect, TextDraft, ToolbarAction, annotation_damage_regions, annotation_hit_test,
-    arrow_handle_hit_test, color_menu_layout, compose_annotated_crop, context_menu_layout, custom_color_menu_layout,
-    custom_hue_at, custom_sat_value_at, custom_slider_value, draft_damage_regions, key_to_ascii, normalized_rect,
-    preload_system_font, render_annotations_patch_with_source, render_context_menu_patch, render_draft_patch_with_move,
-    render_toolbar_patch_with_color, selected_annotation_damage, selected_annotation_hit_test, toolbar_layout,
-    translate_annotation_in_selection,
+    RectI as AnnotationRect, SELECTION_DIMENSIONS_SIZE, SelectionDimensions, TextDraft, ToolbarAction,
+    annotation_damage_regions, annotation_hit_test, arrow_handle_hit_test, color_menu_layout, compose_annotated_crop,
+    context_menu_layout, custom_color_menu_layout, custom_hue_at, custom_sat_value_at, custom_slider_value,
+    draft_damage_regions, key_to_ascii, normalized_rect, preload_system_font, render_annotations_patch_with_source,
+    render_context_menu_patch, render_draft_patch_with_move, render_selection_dimensions_patch,
+    render_toolbar_patch_with_color, selected_annotation_damage, selected_annotation_hit_test,
+    selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
 };
 use rustix::{
     event::{PollFd, PollFlags, poll},
@@ -112,11 +113,14 @@ struct OverlayVisuals {
     border_quads: Vec<OverlayQuad>,
     mask_buffer: wl_buffer::WlBuffer,
     border_buffer: wl_buffer::WlBuffer,
+    dimensions_layer: EditorLayer,
+    pending_dimensions: Option<SelectionDimensions>,
     _solid_file: File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorLayerKind {
+    Dimensions,
     Static,
     Draft,
     Toolbar,
@@ -304,8 +308,26 @@ impl OverlayVisuals {
             border_quads.push(Self::create_quad(compositor, subcompositor, viewporter, parent, queue_handle));
         }
 
-        let visuals =
-            Self { parent: parent.clone(), mask_quads, border_quads, mask_buffer, border_buffer, _solid_file: file };
+        let factory = EditorLayerFactory {
+            compositor,
+            subcompositor,
+            shm,
+            parent,
+            size: SELECTION_DIMENSIONS_SIZE,
+            queue_handle,
+        };
+        let dimensions_layer =
+            EditorLayer::new(EditorLayerKind::Dimensions, &factory, border_quads.last().map(|quad| &quad.surface))?;
+        let visuals = Self {
+            parent: parent.clone(),
+            mask_quads,
+            border_quads,
+            mask_buffer,
+            border_buffer,
+            dimensions_layer,
+            pending_dimensions: None,
+            _solid_file: file,
+        };
         visuals.update_selection(None, None, logical_size);
         Ok(visuals)
     }
@@ -378,11 +400,39 @@ impl OverlayVisuals {
         quad.surface.commit();
     }
 
-    fn top_surface(&self) -> Option<&wl_surface::WlSurface> {
-        self.border_quads.last().map(|quad| &quad.surface).or_else(|| self.mask_quads.last().map(|quad| &quad.surface))
+    fn top_surface(&self) -> &wl_surface::WlSurface {
+        &self.dimensions_layer.surface
+    }
+
+    fn update_dimensions(&mut self, dimensions: Option<SelectionDimensions>) -> Result<(), CaptureError> {
+        self.pending_dimensions = dimensions;
+        if self.pending_dimensions.is_none() {
+            self.dimensions_layer.surface.attach(None, 0, 0);
+            self.dimensions_layer.surface.commit();
+            self.parent.commit();
+        }
+        self.redraw_dimensions()
+    }
+
+    fn redraw_dimensions(&mut self) -> Result<(), CaptureError> {
+        let Some(dimensions) = self.pending_dimensions.as_ref() else {
+            return Ok(());
+        };
+        if !self.dimensions_layer.has_available_buffer() {
+            return Ok(());
+        }
+        let pixels = render_selection_dimensions_patch(dimensions);
+        let region = AnnotationRect { x: 0, y: 0, ..dimensions.bounds };
+        if self.dimensions_layer.redraw_patch(region, &pixels)? {
+            self.dimensions_layer.subsurface.set_position(dimensions.bounds.x, dimensions.bounds.y);
+            self.parent.commit();
+            self.pending_dimensions = None;
+        }
+        Ok(())
     }
 
     fn destroy(self) {
+        self.dimensions_layer.destroy();
         for quad in self.mask_quads.into_iter().chain(self.border_quads) {
             quad.viewport.destroy();
             quad.subsurface.destroy();
@@ -574,6 +624,7 @@ impl EditorSurfaces {
 
     fn mark_released(&mut self, layer: EditorLayerKind, slot: usize) {
         match layer {
+            EditorLayerKind::Dimensions => {}
             EditorLayerKind::Static => self.static_layer.mark_released(slot),
             EditorLayerKind::Draft => self.draft_layer.mark_released(slot),
             EditorLayerKind::Toolbar => self.toolbar_layer.mark_released(slot),
@@ -854,7 +905,7 @@ fn run_connection_mode(
         &queue_handle,
     )?);
     if editor_enabled {
-        let stack_above = state.visuals.as_ref().and_then(OverlayVisuals::top_surface).cloned();
+        let stack_above = state.visuals.as_ref().map(|visuals| visuals.top_surface().clone());
         state.editor_surfaces = Some(EditorSurfaces::new(
             &compositor,
             &subcompositor,
@@ -987,6 +1038,36 @@ fn pointer_selection(
         LogicalRect { x: 0.0, y: 0.0, width: f64::from(logical_size.width), height: f64::from(logical_size.height) },
         frame_size,
     )
+}
+
+fn selection_dimensions(
+    start: (f64, f64),
+    end: (f64, f64),
+    logical_size: PixelSize,
+    frame_size: PixelSize,
+) -> Option<SelectionDimensions> {
+    let selection = normalized_rect(start, end, logical_size)?;
+    let pixels = pointer_selection(start, end, logical_size, frame_size)?;
+    Some(selection_dimensions_layout(selection, pixels, logical_size))
+}
+
+fn update_selection_visuals(
+    state: &mut RuntimeState,
+    start: Option<(f64, f64)>,
+    end: Option<(f64, f64)>,
+    connection: &Connection,
+) {
+    let (Some(logical_size), Some(frame_size), Some(visuals)) =
+        (state.logical_size, state.frame_size, state.visuals.as_mut())
+    else {
+        return;
+    };
+    visuals.update_selection(start, end, logical_size);
+    let dimensions = start.zip(end).and_then(|(start, end)| selection_dimensions(start, end, logical_size, frame_size));
+    if let Err(error) = visuals.update_dimensions(dimensions) {
+        state.runtime_error = Some(error);
+    }
+    let _ = connection.flush();
 }
 
 fn commit_text_input_request(state: &mut RuntimeState, text_input: &zwp_text_input_v3::ZwpTextInputV3) {
@@ -2311,11 +2392,27 @@ impl Dispatch<wl_seat::WlSeat, ()> for RuntimeState {
 }
 
 impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for RuntimeState {
-    fn event(_: &mut Self, _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, _: wp_cursor_shape_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _: wp_cursor_shape_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for RuntimeState {
-    fn event(_: &mut Self, _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, _: wp_cursor_shape_device_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        _: wp_cursor_shape_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
@@ -2327,10 +2424,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
-        if let wl_pointer::Event::Enter { serial, .. } = &event {
-            if let Some(device) = state.cursor_shape_device.as_ref() {
-                device.set_shape(*serial, wp_cursor_shape_device_v1::Shape::Default);
-            }
+        if let wl_pointer::Event::Enter { serial, .. } = &event
+            && let Some(device) = state.cursor_shape_device.as_ref()
+        {
+            device.set_shape(*serial, wp_cursor_shape_device_v1::Shape::Default);
         }
         match event {
             wl_pointer::Event::Enter { surface_x, surface_y, .. }
@@ -2352,11 +2449,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                     } else if state.draft_annotation.is_some() || state.moving.is_some() {
                         update_editor_pointer(state, current, connection);
                     }
-                } else if let (Some(anchor), Some(logical_size), Some(visuals)) =
-                    (state.drag_anchor, state.logical_size, state.visuals.as_ref())
-                {
-                    visuals.update_selection(Some(anchor), Some(current), logical_size);
-                    let _ = connection.flush();
+                } else if let Some(anchor) = state.drag_anchor {
+                    update_selection_visuals(state, Some(anchor), Some(current), connection);
                 }
             }
             wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. }
@@ -2376,10 +2470,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                             begin_editor_pointer(state, current, connection);
                         } else {
                             state.drag_anchor = Some(current);
-                            if let (Some(logical_size), Some(visuals)) = (state.logical_size, state.visuals.as_ref()) {
-                                visuals.update_selection(Some(current), Some(current), logical_size);
-                                let _ = connection.flush();
-                            }
+                            update_selection_visuals(state, Some(current), Some(current), connection);
                         }
                     }
                     wl_pointer::ButtonState::Released => {
@@ -2400,10 +2491,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                             if let (Some(logical_selection), Some(pixel_selection)) =
                                 (logical_selection, pixel_selection)
                             {
-                                if let Some(visuals) = state.visuals.as_ref() {
-                                    visuals.update_selection(Some(anchor), Some(current), logical_size);
-                                    let _ = connection.flush();
-                                }
+                                update_selection_visuals(state, Some(anchor), Some(current), connection);
                                 if state.editor_enabled {
                                     state.editing = true;
                                     state.selection_logical = Some(logical_selection);
@@ -2413,9 +2501,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                                 } else {
                                     state.outcome = Some(RuntimeOutcome::Selected(pixel_selection));
                                 }
-                            } else if let Some(visuals) = state.visuals.as_ref() {
-                                visuals.update_selection(None, None, logical_size);
-                                let _ = connection.flush();
+                            } else {
+                                update_selection_visuals(state, None, None, connection);
                             }
                         }
                     }
@@ -2493,6 +2580,16 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
+            if data.layer == EditorLayerKind::Dimensions {
+                if let Some(visuals) = state.visuals.as_mut() {
+                    visuals.dimensions_layer.mark_released(data.slot);
+                    if let Err(error) = visuals.redraw_dimensions() {
+                        state.runtime_error = Some(error);
+                    }
+                    let _ = connection.flush();
+                }
+                return;
+            }
             if let Some(surfaces) = state.editor_surfaces.as_mut() {
                 surfaces.mark_released(data.layer, data.slot);
             }
@@ -2634,6 +2731,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection, PixelRect { x: 200, y: 100, width: 800, height: 400 });
+    }
+
+    #[test]
+    fn dimension_label_uses_export_pixels_at_fractional_and_axis_scales() {
+        let logical_size = PixelSize { width: 1000, height: 500 };
+        for (frame_size, expected) in [
+            (PixelSize { width: 1000, height: 500 }, "401 × 201 px"),
+            (PixelSize { width: 1250, height: 625 }, "501 × 252 px"),
+            (PixelSize { width: 2000, height: 1000 }, "801 × 401 px"),
+            (PixelSize { width: 2000, height: 1500 }, "801 × 602 px"),
+        ] {
+            let start = (100.25, 50.25);
+            let end = (500.5, 250.5);
+            let dimensions = selection_dimensions(start, end, logical_size, frame_size).unwrap();
+            assert_eq!(dimensions.text, expected);
+            assert_eq!(selection_dimensions(end, start, logical_size, frame_size), Some(dimensions));
+        }
+    }
+
+    #[test]
+    fn dimension_label_clips_to_output_and_hides_for_empty_selection() {
+        let logical_size = PixelSize { width: 1000, height: 500 };
+        let frame_size = PixelSize { width: 2000, height: 1000 };
+        let dimensions = selection_dimensions((-100.0, -50.0), (1100.0, 550.0), logical_size, frame_size).unwrap();
+        assert_eq!(dimensions.text, "2000 × 1000 px");
+        for (start, end) in [
+            ((100.0, 50.0), (100.0, 50.0)),
+            ((100.25, 50.25), (100.25, 50.25)),
+            ((100.0, 50.0), (100.0, 250.0)),
+            ((1100.0, 550.0), (1200.0, 600.0)),
+        ] {
+            assert_eq!(selection_dimensions(start, end, logical_size, frame_size), None);
+        }
     }
 
     #[test]

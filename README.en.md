@@ -38,6 +38,7 @@ LiSnap is a work-in-progress desktop screenshot editor with a straightforward wo
 ## Highlights
 
 - **Native Wayland capture:** Uses the active Hyprland monitor automatically, or an explicitly selected output via `--screen`. Opens a frozen frame with draggable region selection.
+- **Live pixel dimensions:** Displays width × height (px) at the selection's top-left using actual capture pixels, including on scaled displays. The label is not included in saved or copied images.
 - **Inline annotation:** Pen, rectangle, arrow, text, and mosaic, with selection/movement of existing annotations, draggable arrow endpoints, double-click text editing, and undo/redo.
 - **Flexible drawing styles:** 12 preset colors, custom HSV selection, RGB/HEX input, plus configurable line width, font size, and mosaic block size.
 - **Save or copy:** Save/Confirm writes an annotated PNG; Copy sends PNG data to the Wayland clipboard using `wl-copy` without creating an extra file.
