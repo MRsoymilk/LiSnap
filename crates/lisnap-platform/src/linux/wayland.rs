@@ -1,6 +1,7 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
 mod annotation;
 mod ext;
+mod magnifier;
 mod overlay;
 mod overlay_runtime;
 mod selection;

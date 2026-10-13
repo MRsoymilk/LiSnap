@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 
+use super::magnifier::{MagnifierPreview, PIXEL_GRID, PIXEL_RADIUS, PIXEL_ZOOM};
 use fontdue::{Font, FontSettings};
 use lisnap_core::{CaptureError, CaptureFrame, PixelRect, PixelSize, RgbaImage};
 
@@ -760,6 +761,39 @@ pub(crate) fn render_selection_dimensions_patch(dimensions: &SelectionDimensions
     let mut raster = patch_raster(bounds);
     raster.fill_rect_replace(bounds, TOOLBAR_BG);
     raster.draw_text_bitmap((10, 8), &dimensions.text, 2, TOOLBAR_ICON);
+    finish_patch(raster)
+}
+
+pub(crate) fn render_magnifier_patch(preview: &MagnifierPreview) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..preview.bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, [24, 27, 32, 255]);
+    raster.draw_text_bitmap((10, 8), "12x PIXELS", 2, TOOLBAR_ICON);
+    let grid_x = 44;
+    let grid_y = 28;
+    for (index, color) in preview.sample.neighbors.iter().enumerate() {
+        let cell = RectI {
+            x: grid_x + (index % PIXEL_GRID) as i32 * PIXEL_ZOOM,
+            y: grid_y + (index / PIXEL_GRID) as i32 * PIXEL_ZOOM,
+            width: PIXEL_ZOOM,
+            height: PIXEL_ZOOM,
+        };
+        raster.fill_rect_replace(cell, [color[0], color[1], color[2], 255]);
+    }
+    let center = RectI {
+        x: grid_x + PIXEL_RADIUS * PIXEL_ZOOM,
+        y: grid_y + PIXEL_RADIUS * PIXEL_ZOOM,
+        width: PIXEL_ZOOM,
+        height: PIXEL_ZOOM,
+    };
+    // Black + white outlines remain visible on both light and dark sampled pixels.
+    raster.draw_rect_outline(center, 3, [0, 0, 0, 255]);
+    raster.draw_rect_outline(center, 1, [255, 255, 255, 255]);
+    let color = preview.sample.color;
+    raster.fill_rect_replace(RectI { x: 10, y: 174, width: 24, height: 20 }, [color[0], color[1], color[2], 255]);
+    raster.draw_text_bitmap((42, 176), &preview.sample.hex_color(), 2, TOOLBAR_ICON);
+    raster.draw_text_bitmap((10, 200), &preview.sample.rgb_color(), 2, TOOLBAR_ICON);
+    raster.draw_text_bitmap((10, 222), &format!("X:{} Y:{}", preview.sample.x, preview.sample.y), 1, TOOLBAR_ICON);
     finish_patch(raster)
 }
 
@@ -2051,6 +2085,52 @@ mod tests {
     use super::*;
     use lisnap_core::ScreenInfo;
     use std::time::SystemTime;
+
+    #[test]
+    fn magnifier_renders_nearest_neighbor_pixels_center_marker_and_color_swatch() {
+        let size = PixelSize { width: 20, height: 20 };
+        let pixels = (0..size.height)
+            .flat_map(|y| (0..size.width).flat_map(move |x| [(x * 10) as u8, (y * 10) as u8, 64, 255]))
+            .collect();
+        let image = RgbaImage::new(size, pixels).unwrap();
+        let original = image.pixels().to_vec();
+        let preview =
+            super::super::magnifier::magnifier_preview(&image, PixelSize { width: 1000, height: 600 }, (500.0, 300.0))
+                .unwrap();
+        let patch = render_magnifier_patch(&preview);
+        assert_eq!(patch.len(), preview.bounds.width as usize * preview.bounds.height as usize * 4);
+        let at = |x: usize, y: usize| {
+            let i = (y * preview.bounds.width as usize + x) * 4;
+            &patch[i..i + 4]
+        };
+        assert_eq!(at(50, 34), &[64, 50, 50, 255]);
+        assert_eq!(at(51, 35), at(50, 34));
+        assert_eq!(at(110, 94), &[64, 100, 100, 255]);
+        assert_eq!(at(104, 88), &[255, 255, 255, 255]);
+        assert_eq!(at(20, 180), &[64, 100, 100, 255]);
+        assert_eq!(image.pixels(), original);
+    }
+
+    #[test]
+    fn magnifier_renderer_clips_small_screens_without_changing_output_pixels() {
+        let size = PixelSize { width: 10, height: 10 };
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display".into(),
+                logical_geometry: None,
+                pixel_size: size,
+                scale_factor: Some(1.0),
+            },
+            image: RgbaImage::new(size, [10, 20, 30, 255].repeat(100)).unwrap(),
+            captured_at: SystemTime::now(),
+        };
+        let preview = super::super::magnifier::magnifier_preview(&frame.image, size, (5.0, 5.0)).unwrap();
+        assert_eq!(render_magnifier_patch(&preview).len(), 400);
+        let selection = PixelRect { x: 0, y: 0, width: 10, height: 10 };
+        let output = compose_annotated_crop(&frame, size, selection, &[]).unwrap();
+        assert_eq!(output.pixels(), frame.image.pixels());
+    }
 
     #[test]
     fn selection_dimensions_prefer_selection_top_left_and_stay_on_screen() {

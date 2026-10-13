@@ -16,10 +16,11 @@ use super::annotation::{
     annotation_damage_regions, annotation_hit_test, arrow_handle_hit_test, color_menu_layout, compose_annotated_crop,
     context_menu_layout, custom_color_menu_layout, custom_hue_at, custom_sat_value_at, custom_slider_value,
     draft_damage_regions, key_to_ascii, normalized_rect, preload_system_font, render_annotations_patch_with_source,
-    render_context_menu_patch, render_draft_patch_with_move, render_selection_dimensions_patch,
+    render_context_menu_patch, render_draft_patch_with_move, render_magnifier_patch, render_selection_dimensions_patch,
     render_toolbar_patch_with_color, selected_annotation_damage, selected_annotation_hit_test,
     selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
 };
+use super::magnifier::{MAGNIFIER_SIZE, magnifier_preview};
 use super::selection::{ResizeHandle, resize_handle_rects, resize_hit_test, resized_selection};
 use rustix::{
     event::{PollFd, PollFlags, poll},
@@ -60,6 +61,7 @@ const RIGHT_CTRL_KEY: u32 = 97;
 const Z_KEY: u32 = 44;
 const Y_KEY: u32 = 21;
 const A_KEY: u32 = 30;
+const M_KEY: u32 = 50;
 const DELETE_KEY: u32 = 111;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TEXT_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -123,6 +125,7 @@ struct OverlayVisuals {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorLayerKind {
     Dimensions,
+    Magnifier,
     Static,
     Draft,
     Toolbar,
@@ -262,6 +265,10 @@ struct RuntimeState {
     redo_operations: Vec<EditOperation>,
     moving: Option<MovingAnnotation>,
     mosaic_source: Option<MosaicSource>,
+    magnifier_layer: Option<EditorLayer>,
+    magnifier_enabled: bool,
+    magnifier_visible: bool,
+    magnifier_dirty: bool,
     draft_annotation: Option<DraftAnnotation>,
     text_draft: Option<TextDraft>,
     stroke_width: i32,
@@ -661,7 +668,7 @@ impl EditorSurfaces {
 
     fn mark_released(&mut self, layer: EditorLayerKind, slot: usize) {
         match layer {
-            EditorLayerKind::Dimensions => {}
+            EditorLayerKind::Dimensions | EditorLayerKind::Magnifier => {}
             EditorLayerKind::Static => self.static_layer.mark_released(slot),
             EditorLayerKind::Draft => self.draft_layer.mark_released(slot),
             EditorLayerKind::Toolbar => self.toolbar_layer.mark_released(slot),
@@ -804,6 +811,7 @@ fn run_connection_mode(
     let _registry = display.get_registry(&queue_handle, ());
     let mut state = RuntimeState {
         editor_enabled,
+        magnifier_enabled: true,
         stroke_width: 3,
         font_size: 24,
         mosaic_block_size: 18,
@@ -875,12 +883,10 @@ fn run_connection_mode(
     }
     layer_surface.ack_configure(serial);
     state.logical_size = Some(PixelSize { width: logical_width, height: logical_height });
-    if editor_enabled {
-        state.mosaic_source = Some(MosaicSource {
-            image: frame.image.clone(),
-            logical_size: PixelSize { width: logical_width, height: logical_height },
-        });
-    }
+    state.mosaic_source = Some(MosaicSource {
+        image: frame.image.clone(),
+        logical_size: PixelSize { width: logical_width, height: logical_height },
+    });
 
     let frame_size = frame.image.size();
     state.frame_size = Some(frame_size);
@@ -953,6 +959,23 @@ fn run_connection_mode(
             &queue_handle,
         )?);
     }
+    let magnifier_factory = EditorLayerFactory {
+        compositor: &compositor,
+        subcompositor: &subcompositor,
+        shm: &shm,
+        parent: &surface,
+        size: MAGNIFIER_SIZE,
+        queue_handle: &queue_handle,
+    };
+    let stack_above = state
+        .editor_surfaces
+        .as_ref()
+        .map(|surfaces| &surfaces.menu_layer.surface)
+        .or_else(|| state.visuals.as_ref().map(OverlayVisuals::top_surface));
+    state.magnifier_layer = Some(EditorLayer::new(EditorLayerKind::Magnifier, &magnifier_factory, stack_above)?);
+    surface.commit();
+    state.magnifier_dirty = true;
+    redraw_magnifier(&mut state, &connection);
     event_queue
         .flush()
         .map_err(|error| CaptureError::BackendFailure(format!("mapping Wayland overlay failed: {error}")))?;
@@ -965,6 +988,9 @@ fn run_connection_mode(
             text_input.commit();
         }
         text_input.destroy();
+    }
+    if let Some(magnifier) = state.magnifier_layer.take() {
+        magnifier.destroy();
     }
     if let Some(editor_surfaces) = state.editor_surfaces.take() {
         editor_surfaces.destroy();
@@ -1215,7 +1241,84 @@ fn apply_text_input_done(state: &mut RuntimeState, serial: u32, connection: &Con
     redraw_editor(state, connection);
 }
 
+fn should_show_magnifier(state: &RuntimeState) -> bool {
+    if !state.magnifier_enabled || state.pointer_position.is_none() {
+        return false;
+    }
+    if !state.editing {
+        return true;
+    }
+    if state.context_menu.is_some()
+        || state.text_draft.is_some()
+        || state.draft_annotation.is_some()
+        || state.moving.is_some()
+    {
+        return false;
+    }
+    if let (Some(selection), Some(screen), Some(point)) =
+        (state.selection_logical, state.logical_size, state.pointer_position)
+        && toolbar_layout(selection, screen).bounds.contains(point)
+    {
+        return false;
+    }
+    true
+}
+
+fn redraw_magnifier(state: &mut RuntimeState, connection: &Connection) {
+    let visible = should_show_magnifier(state);
+    let Some(layer) = state.magnifier_layer.as_mut() else {
+        return;
+    };
+    if !visible {
+        if state.magnifier_visible {
+            layer.surface.attach(None, 0, 0);
+            layer.surface.commit();
+            if let Some(visuals) = state.visuals.as_ref() {
+                visuals.parent.commit();
+            }
+            let _ = connection.flush();
+        }
+        state.magnifier_visible = false;
+        state.magnifier_dirty = false;
+        return;
+    }
+    if (state.magnifier_visible && !state.magnifier_dirty) || !layer.has_available_buffer() {
+        return;
+    }
+    let (Some(source), Some(point)) = (state.mosaic_source.as_ref(), state.pointer_position) else {
+        return;
+    };
+    let Some(preview) = magnifier_preview(&source.image, source.logical_size, point) else {
+        return;
+    };
+    let pixels = render_magnifier_patch(&preview);
+    let region = AnnotationRect { x: 0, y: 0, ..preview.bounds };
+    match layer.redraw_patch(region, &pixels) {
+        Ok(true) => {
+            layer.subsurface.set_position(preview.bounds.x, preview.bounds.y);
+            state.magnifier_visible = true;
+            state.magnifier_dirty = false;
+            if let Some(visuals) = state.visuals.as_ref() {
+                visuals.parent.commit();
+            }
+            if let Err(error) = connection.flush() {
+                state.runtime_error =
+                    Some(CaptureError::BackendFailure(format!("flushing pixel magnifier failed: {error}")));
+            }
+        }
+        Ok(false) => {}
+        Err(error) => state.runtime_error = Some(error),
+    }
+}
+
+fn can_toggle_magnifier(state: &RuntimeState) -> bool {
+    !state.ctrl_pressed
+        && state.text_draft.is_none()
+        && !state.context_menu.as_ref().is_some_and(|menu| menu.kind == ContextMenuKind::CustomColor)
+}
+
 fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
+    redraw_magnifier(state, connection);
     if !state.editor_enabled || !state.editing {
         return;
     }
@@ -2622,6 +2725,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                 } else if let Some(anchor) = state.drag_anchor {
                     update_selection_visuals(state, Some(anchor), Some(current), connection);
                 }
+                state.magnifier_dirty = true;
+                redraw_magnifier(state, connection);
+            }
+            wl_pointer::Event::Leave { .. } => {
+                state.pointer_position = None;
+                state.pointer_enter_serial = None;
+                redraw_magnifier(state, connection);
             }
             wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. }
                 if button == BTN_RIGHT && button_state == wl_pointer::ButtonState::Pressed && state.editing =>
@@ -2695,6 +2805,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if let wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } = event {
+            if key == M_KEY && key_state == wl_keyboard::KeyState::Pressed && can_toggle_magnifier(state) {
+                state.magnifier_enabled = !state.magnifier_enabled;
+                state.magnifier_dirty = true;
+                redraw_magnifier(state, connection);
+                return;
+            }
             let pressed = matches!(key_state, wl_keyboard::KeyState::Pressed | wl_keyboard::KeyState::Repeated);
             if state.editor_enabled && state.editing {
                 handle_editor_key(state, key, pressed, connection);
@@ -2751,6 +2867,13 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
+            if data.layer == EditorLayerKind::Magnifier {
+                if let Some(layer) = state.magnifier_layer.as_mut() {
+                    layer.mark_released(data.slot);
+                }
+                redraw_magnifier(state, connection);
+                return;
+            }
             if data.layer == EditorLayerKind::Dimensions {
                 if let Some(visuals) = state.visuals.as_mut() {
                     visuals.dimensions_layer.mark_released(data.slot);
@@ -2897,6 +3020,53 @@ mod tests {
             selection_pixels: Some(PixelRect { x: 150, y: 120, width: 600, height: 300 }),
             ..RuntimeState::default()
         }
+    }
+
+    #[test]
+    fn magnifier_is_available_during_selection_and_resize_but_hides_over_editor_controls() {
+        let mut state =
+            RuntimeState { magnifier_enabled: true, pointer_position: Some((100.0, 100.0)), ..RuntimeState::default() };
+        assert!(should_show_magnifier(&state));
+        state.magnifier_enabled = false;
+        assert!(!should_show_magnifier(&state));
+        state.magnifier_enabled = true;
+        state.pointer_position = None;
+        assert!(!should_show_magnifier(&state));
+        let mut state = resize_test_state();
+        state.magnifier_enabled = true;
+        state.pointer_position = Some((500.0, 280.0));
+        assert!(begin_selection_resize(&mut state, (500.0, 280.0)));
+        assert!(should_show_magnifier(&state));
+        finish_selection_resize(&mut state);
+        let toolbar = toolbar_layout(state.selection_logical.unwrap(), state.logical_size.unwrap());
+        state.pointer_position = Some((f64::from(toolbar.bounds.x + 10), f64::from(toolbar.bounds.y + 10)));
+        assert!(!should_show_magnifier(&state));
+        state.pointer_position = Some((300.0, 180.0));
+        assert!(should_show_magnifier(&state));
+        state.context_menu = Some(color_menu_layout((300.0, 180.0), state.logical_size.unwrap()));
+        assert!(!should_show_magnifier(&state));
+        state.context_menu = None;
+        state.draft_annotation =
+            Some(DraftAnnotation::Pen { points: vec![(300.0, 180.0)], width: 3, color: DEFAULT_COLOR });
+        assert!(!should_show_magnifier(&state));
+        state.draft_annotation = None;
+        state.text_draft = Some(TextDraft::new((300.0, 180.0)));
+        assert!(!should_show_magnifier(&state));
+    }
+
+    #[test]
+    fn magnifier_shortcut_does_not_intercept_text_or_custom_color_input() {
+        let mut state = resize_test_state();
+        assert!(can_toggle_magnifier(&state));
+        state.text_draft = Some(TextDraft::new((300.0, 180.0)));
+        assert!(!can_toggle_magnifier(&state));
+        assert_eq!(key_to_ascii(M_KEY, false), Some('m'));
+        state.text_draft = None;
+        state.ctrl_pressed = true;
+        assert!(!can_toggle_magnifier(&state));
+        state.ctrl_pressed = false;
+        state.context_menu = Some(custom_color_menu_layout((300.0, 180.0), state.logical_size.unwrap()));
+        assert!(!can_toggle_magnifier(&state));
     }
 
     #[test]
