@@ -9,6 +9,8 @@ use std::{
     thread,
 };
 
+use super::feedback::EditorFeedback;
+use super::magnifier::{MagnifierPreview, PIXEL_GRID, PIXEL_RADIUS, PIXEL_ZOOM};
 use fontdue::{Font, FontSettings};
 use lisnap_core::{CaptureError, CaptureFrame, PixelRect, PixelSize, RgbaImage};
 
@@ -198,6 +200,32 @@ impl ContextMenu {
 
 // Menu backing stores the largest popup. Ordinary popups keep their compact dimensions.
 pub(crate) const CONTEXT_MENU_SIZE: PixelSize = PixelSize { width: 244, height: 440 };
+// Enough for two u32 dimensions, a separator and the pixel unit at bitmap scale 2.
+pub(crate) const SELECTION_DIMENSIONS_SIZE: PixelSize = PixelSize { width: 332, height: 30 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectionDimensions {
+    pub(crate) bounds: RectI,
+    pub(crate) text: String,
+}
+
+pub(crate) fn selection_dimensions_layout(
+    selection: RectI,
+    pixels: PixelRect,
+    screen: PixelSize,
+) -> SelectionDimensions {
+    let text = format!("{} × {} px", pixels.width, pixels.height);
+    let screen_width = i32::try_from(screen.width).unwrap_or(i32::MAX);
+    let screen_height = i32::try_from(screen.height).unwrap_or(i32::MAX);
+    let width = (text.chars().count() as i32 * 12 + 20).min(screen_width);
+    let height = (SELECTION_DIMENSIONS_SIZE.height as i32).min(screen_height);
+    let x = selection.x.clamp(0, (screen_width - width).max(0));
+    // Prefer the space above the selection; at the screen's top edge, move inside.
+    let y = if selection.y >= height + 6 { selection.y - height - 6 } else { selection.y + 6 };
+    let y = y.clamp(0, (screen_height - height).max(0));
+    SelectionDimensions { bounds: RectI { x, y, width, height }, text }
+}
+
 const SV_WIDTH: usize = 216;
 const SV_HEIGHT: usize = 128;
 const HUE_STRIP_WIDTH: usize = 216;
@@ -726,6 +754,66 @@ pub(crate) fn render_toolbar_patch_with_color(toolbar: &ToolbarLayout, tool: Edi
     let mut raster = patch_raster(toolbar.bounds);
     raster.clip = None;
     draw_toolbar(&mut raster, toolbar, tool, color);
+    finish_patch(raster)
+}
+
+pub(crate) fn render_selection_dimensions_patch(dimensions: &SelectionDimensions) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..dimensions.bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, TOOLBAR_BG);
+    raster.draw_text_bitmap((10, 8), &dimensions.text, 2, TOOLBAR_ICON);
+    finish_patch(raster)
+}
+
+pub(crate) fn render_feedback_patch(bounds: RectI, feedback: &EditorFeedback) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, [24, 27, 32, 255]);
+    let accent = if feedback.failed { [255, 105, 105, 255] } else { [88, 220, 145, 255] };
+    raster.fill_rect_replace(RectI { x: 0, y: 0, width: 5, height: bounds.height }, accent);
+    if system_font().is_some() {
+        draw_text(&mut raster, (20.0, 12.0), feedback.title(true), 20, accent, 1.0, 1.0);
+    } else {
+        raster.draw_text_bitmap((20, 14), feedback.title(false), 2, accent);
+    }
+    let max_chars = ((bounds.width - 40).max(0) / 14) as usize;
+    let detail: Vec<_> = feedback.display_detail(max_chars * 2).chars().collect();
+    let detail =
+        detail.chunks(max_chars.max(1)).map(|line| line.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    draw_text(&mut raster, (20.0, 44.0), &detail, 14, TOOLBAR_ICON, 1.0, 1.0);
+    finish_patch(raster)
+}
+
+pub(crate) fn render_magnifier_patch(preview: &MagnifierPreview) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..preview.bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, [24, 27, 32, 255]);
+    raster.draw_text_bitmap((10, 8), "12x PIXELS", 2, TOOLBAR_ICON);
+    let grid_x = 44;
+    let grid_y = 28;
+    for (index, color) in preview.sample.neighbors.iter().enumerate() {
+        let cell = RectI {
+            x: grid_x + (index % PIXEL_GRID) as i32 * PIXEL_ZOOM,
+            y: grid_y + (index / PIXEL_GRID) as i32 * PIXEL_ZOOM,
+            width: PIXEL_ZOOM,
+            height: PIXEL_ZOOM,
+        };
+        raster.fill_rect_replace(cell, [color[0], color[1], color[2], 255]);
+    }
+    let center = RectI {
+        x: grid_x + PIXEL_RADIUS * PIXEL_ZOOM,
+        y: grid_y + PIXEL_RADIUS * PIXEL_ZOOM,
+        width: PIXEL_ZOOM,
+        height: PIXEL_ZOOM,
+    };
+    // Black + white outlines remain visible on both light and dark sampled pixels.
+    raster.draw_rect_outline(center, 3, [0, 0, 0, 255]);
+    raster.draw_rect_outline(center, 1, [255, 255, 255, 255]);
+    let color = preview.sample.color;
+    raster.fill_rect_replace(RectI { x: 10, y: 174, width: 24, height: 20 }, [color[0], color[1], color[2], 255]);
+    raster.draw_text_bitmap((42, 176), &preview.sample.hex_color(), 2, TOOLBAR_ICON);
+    raster.draw_text_bitmap((10, 200), &preview.sample.rgb_color(), 2, TOOLBAR_ICON);
+    raster.draw_text_bitmap((10, 222), &format!("X:{} Y:{}", preview.sample.x, preview.sample.y), 1, TOOLBAR_ICON);
     finish_patch(raster)
 }
 
@@ -1974,7 +2062,7 @@ fn glyph5x7(ch: char) -> [u8; 7] {
         'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
         'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'X' | '×' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
         'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
         'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
         '0' => [0b01110, 0b10011, 0b10101, 0b10101, 0b11001, 0b10001, 0b01110],
@@ -2017,6 +2105,114 @@ mod tests {
     use super::*;
     use lisnap_core::ScreenInfo;
     use std::time::SystemTime;
+
+    #[test]
+    fn output_feedback_renders_success_and_failure_and_clips_to_small_outputs() {
+        for failed in [false, true] {
+            let feedback = EditorFeedback { copy: false, failed, detail: "/tmp/截图.png".into() };
+            let full = render_feedback_patch(RectI { x: 200, y: 24, width: 520, height: 88 }, &feedback);
+            assert_eq!(full.len(), 520 * 88 * 4);
+            assert_eq!(&full[..4], if failed { &[105, 105, 255, 255] } else { &[145, 220, 88, 255] });
+            assert!(full.chunks_exact(4).all(|pixel| pixel[3] == 255));
+            assert_eq!(render_feedback_patch(RectI { x: 0, y: 0, width: 10, height: 10 }, &feedback).len(), 400);
+        }
+    }
+
+    #[test]
+    fn magnifier_renders_nearest_neighbor_pixels_center_marker_and_color_swatch() {
+        let size = PixelSize { width: 20, height: 20 };
+        let pixels = (0..size.height)
+            .flat_map(|y| (0..size.width).flat_map(move |x| [(x * 10) as u8, (y * 10) as u8, 64, 255]))
+            .collect();
+        let image = RgbaImage::new(size, pixels).unwrap();
+        let original = image.pixels().to_vec();
+        let preview =
+            super::super::magnifier::magnifier_preview(&image, PixelSize { width: 1000, height: 600 }, (500.0, 300.0))
+                .unwrap();
+        let patch = render_magnifier_patch(&preview);
+        assert_eq!(patch.len(), preview.bounds.width as usize * preview.bounds.height as usize * 4);
+        let at = |x: usize, y: usize| {
+            let i = (y * preview.bounds.width as usize + x) * 4;
+            &patch[i..i + 4]
+        };
+        assert_eq!(at(50, 34), &[64, 50, 50, 255]);
+        assert_eq!(at(51, 35), at(50, 34));
+        assert_eq!(at(110, 94), &[64, 100, 100, 255]);
+        assert_eq!(at(104, 88), &[255, 255, 255, 255]);
+        assert_eq!(at(20, 180), &[64, 100, 100, 255]);
+        assert_eq!(image.pixels(), original);
+    }
+
+    #[test]
+    fn magnifier_renderer_clips_small_screens_without_changing_output_pixels() {
+        let size = PixelSize { width: 10, height: 10 };
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display".into(),
+                logical_geometry: None,
+                pixel_size: size,
+                scale_factor: Some(1.0),
+            },
+            image: RgbaImage::new(size, [10, 20, 30, 255].repeat(100)).unwrap(),
+            captured_at: SystemTime::now(),
+        };
+        let preview = super::super::magnifier::magnifier_preview(&frame.image, size, (5.0, 5.0)).unwrap();
+        assert_eq!(render_magnifier_patch(&preview).len(), 400);
+        let selection = PixelRect { x: 0, y: 0, width: 10, height: 10 };
+        let output = compose_annotated_crop(&frame, size, selection, &[]).unwrap();
+        assert_eq!(output.pixels(), frame.image.pixels());
+    }
+
+    #[test]
+    fn selection_dimensions_prefer_selection_top_left_and_stay_on_screen() {
+        let screen = PixelSize { width: 1920, height: 1080 };
+        let pixels = PixelRect { x: 0, y: 0, width: 800, height: 400 };
+        let dimensions = selection_dimensions_layout(RectI { x: 100, y: 100, width: 400, height: 200 }, pixels, screen);
+        assert_eq!(dimensions.text, "800 × 400 px");
+        assert_eq!(dimensions.bounds.x, 100);
+        assert_eq!(dimensions.bounds.y, 64);
+        for selection in [
+            RectI { x: 0, y: 0, width: 1920, height: 1080 },
+            RectI { x: 1900, y: 0, width: 20, height: 20 },
+            RectI { x: 1900, y: 1060, width: 20, height: 20 },
+        ] {
+            let bounds = selection_dimensions_layout(selection, pixels, screen).bounds;
+            assert!(bounds.x >= 0 && bounds.y >= 0);
+            assert!(bounds.x + bounds.width <= screen.width as i32);
+            assert!(bounds.y + bounds.height <= screen.height as i32);
+            if selection.y == 0 {
+                assert_eq!(bounds.y, 6);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_dimensions_fit_backing_and_render_text_without_system_font() {
+        let dimensions = selection_dimensions_layout(
+            RectI { x: 100, y: 100, width: 400, height: 200 },
+            PixelRect { x: 0, y: 0, width: u32::MAX, height: u32::MAX },
+            PixelSize { width: 1920, height: 1080 },
+        );
+        assert!(dimensions.bounds.width <= SELECTION_DIMENSIONS_SIZE.width as i32);
+        assert!(dimensions.bounds.height <= SELECTION_DIMENSIONS_SIZE.height as i32);
+        let patch = render_selection_dimensions_patch(&dimensions);
+        assert_eq!(patch.len(), dimensions.bounds.width as usize * dimensions.bounds.height as usize * 4);
+        assert!(patch.chunks_exact(4).any(|pixel| pixel[3] == 255));
+        assert!(patch.chunks_exact(4).any(|pixel| pixel[3] == TOOLBAR_BG[3]));
+        assert_eq!(glyph5x7('×'), glyph5x7('X'));
+    }
+
+    #[test]
+    fn selection_dimensions_clamp_on_tiny_screens() {
+        let dimensions = selection_dimensions_layout(
+            RectI { x: 5, y: 5, width: 5, height: 5 },
+            PixelRect { x: 5, y: 5, width: 5, height: 5 },
+            PixelSize { width: 10, height: 10 },
+        );
+        assert_eq!(dimensions.bounds, RectI { x: 0, y: 0, width: 10, height: 10 });
+        assert_eq!(render_selection_dimensions_patch(&dimensions).len(), 10 * 10 * 4);
+    }
 
     #[test]
     fn toolbar_stays_on_screen_and_hits_buttons() {

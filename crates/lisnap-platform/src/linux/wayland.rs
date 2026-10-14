@@ -1,8 +1,11 @@
 //! Wayland registry probing for direct capture capabilities; no Portal fallback.
 mod annotation;
 mod ext;
+mod feedback;
+mod magnifier;
 mod overlay;
 mod overlay_runtime;
+mod selection;
 mod shm;
 mod wlr;
 
@@ -94,6 +97,12 @@ pub enum WaylandEditorOutcome {
     Cancelled,
     Closed,
 }
+
+/// Execute a save/copy while the editor is visible. Return a success detail (for
+/// example, the saved path), or an error to display while keeping the editor open.
+/// The boolean is `true` for clipboard copy and `false` for save/confirm.
+pub type WaylandEditorOutputHandler<'a> =
+    dyn FnMut(PixelRect, &lisnap_core::RgbaImage, bool) -> Result<String, String> + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaylandProbe {
@@ -422,11 +431,31 @@ pub fn run_frozen_overlay_socket(path: &Path, frame: &CaptureFrame) -> Result<Wa
 pub fn run_editor(frame: &CaptureFrame) -> Result<WaylandEditorOutcome, CaptureError> {
     let connection = Connection::connect_to_env()
         .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
-    map_editor_outcome(overlay_runtime::run_editor_connection(connection, frame)?)
+    map_editor_outcome(overlay_runtime::run_editor_connection(connection, frame, None)?)
 }
 
 pub fn run_editor_socket(path: &Path, frame: &CaptureFrame) -> Result<WaylandEditorOutcome, CaptureError> {
-    map_editor_outcome(overlay_runtime::run_editor_connection(connect_socket(path)?, frame)?)
+    map_editor_outcome(overlay_runtime::run_editor_connection(connect_socket(path)?, frame, None)?)
+}
+
+/// Save/copy through `output`, immediately release the capture UI on success,
+/// and show a short non-interactive confirmation. Failures keep the editor open.
+/// An Accepted outcome means `output` already completed; do not execute it again.
+pub fn run_editor_with_output(
+    frame: &CaptureFrame,
+    output: &mut WaylandEditorOutputHandler<'_>,
+) -> Result<WaylandEditorOutcome, CaptureError> {
+    let connection = Connection::connect_to_env()
+        .map_err(|error| CaptureError::BackendFailure(format!("Wayland connection failed: {error}")))?;
+    map_editor_outcome(overlay_runtime::run_editor_connection(connection, frame, Some(output))?)
+}
+
+pub fn run_editor_socket_with_output(
+    path: &Path,
+    frame: &CaptureFrame,
+    output: &mut WaylandEditorOutputHandler<'_>,
+) -> Result<WaylandEditorOutcome, CaptureError> {
+    map_editor_outcome(overlay_runtime::run_editor_connection(connect_socket(path)?, frame, Some(output))?)
 }
 
 fn map_editor_outcome(outcome: overlay_runtime::EditorOverlayOutcome) -> Result<WaylandEditorOutcome, CaptureError> {

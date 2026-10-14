@@ -54,3 +54,15 @@ fn derives_axis_scales_from_actual_pixel_size() {
         Some(PixelRect { x: 50, y: 75, width: 100, height: 150 })
     );
 }
+
+#[test]
+fn exact_fractionally_scaled_edges_do_not_gain_an_extra_pixel() {
+    assert_eq!(
+        selection_to_pixels(
+            LogicalRect { x: 100.0, y: 80.0, width: 300.0, height: 200.0 },
+            LogicalRect { x: 0.0, y: 0.0, width: 1000.0, height: 500.0 },
+            PixelSize { width: 1500, height: 750 },
+        ),
+        Some(PixelRect { x: 150, y: 120, width: 450, height: 300 }),
+    );
+}

@@ -38,9 +38,12 @@ LiSnap is a work-in-progress desktop screenshot editor with a straightforward wo
 ## Highlights
 
 - **Native Wayland capture:** Uses the active Hyprland monitor automatically, or an explicitly selected output via `--screen`. Opens a frozen frame with draggable region selection.
+- **Live pixel dimensions:** Displays width × height (px) at the selection's top-left using actual capture pixels, including on scaled displays. The label is not included in saved or copied images.
+- **Pixel magnifier and color inspection:** A 12× magnifier follows the pointer, highlights the center pixel, and shows its HEX / RGB color and pixel coordinates. Samples come from the original frozen capture, not the mask or annotations. Press `M` to show/hide it; it hides automatically during drawing, text entry, and tool menus, and is excluded from exported images.
 - **Inline annotation:** Pen, rectangle, arrow, text, and mosaic, with selection/movement of existing annotations, draggable arrow endpoints, double-click text editing, and undo/redo.
 - **Flexible drawing styles:** 12 preset colors, custom HSV selection, RGB/HEX input, plus configurable line width, font size, and mosaic block size.
 - **Save or copy:** Save/Confirm writes an annotated PNG; Copy sends PNG data to the Wayland clipboard using `wl-copy` without creating an extra file.
+- **Output feedback:** Successful Save/Copy immediately dismisses the capture UI and releases mouse/keyboard focus, leaving only an independent confirmation (including the saved path) for about 2 seconds. The toast does not intercept input, so other windows remain usable immediately. Failures show an error and keep the editor open so you can retry.
 - **Cursor and text input:** Captured images exclude the pointer by default while the live pointer stays usable. Unicode text entry and Wayland `text-input-v3` integration are implemented, subject to compositor and IME support.
 
 > **Alpha software:** Automated checks cover capture protocols, pixel processing, and editor logic. Multi-monitor scenarios, clipboard interoperability, and IME behavior still require verification in an actual Hyprland desktop session.
@@ -106,6 +109,8 @@ For the complete CLI reference, run `cargo run -p lisnap -- --help`.
 | Action | How to use |
 | --- | --- |
 | Select a region | Drag with the left mouse button over the frozen screen |
+| Resize selection | Drag any edge or one of eight handles after selecting; `Esc` cancels the resize, `Ctrl+Z` / `Ctrl+Y` undo/redo it. Existing annotations are retained and clipped to the new region |
+| Magnify pixels / Inspect colors | Move the pointer to inspect the center pixel's HEX / RGB color; `M` shows/hides the magnifier (except during text entry) |
 | Pen / Rectangle / Arrow / Text | Toolbar buttons or `P` / `R` / `A` / `T` |
 | Mosaic | Select the mosaic tool and drag across a region |
 | Modify annotations | Click to select and drag; resize arrows by dragging endpoints; double-click text to edit |

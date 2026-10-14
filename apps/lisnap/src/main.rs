@@ -95,27 +95,39 @@ fn run_interactive_capture(cli: &Cli) -> Result<(), String> {
     let frame =
         frames.into_iter().next().ok_or_else(|| format!("Wayland capture returned no frame for output {screen_id}"))?;
 
+    let mut output = |selection: lisnap_core::PixelRect, image: &lisnap_core::RgbaImage, copy: bool| {
+        if copy {
+            copy_png_to_clipboard(image)?;
+            println!(
+                "Copied {}x{} annotated capture from {} to clipboard",
+                selection.width, selection.height, frame.screen.id
+            );
+            Ok(format!("{} x {} px - PNG", selection.width, selection.height))
+        } else {
+            let output = cli.output_path.as_deref().map(PathBuf::from).unwrap_or_else(default_output_path);
+            save_png(&output, image)?;
+            println!(
+                "Saved {}x{} annotated capture from {} at {},{} to {}",
+                selection.width,
+                selection.height,
+                frame.screen.id,
+                selection.x,
+                selection.y,
+                output.display()
+            );
+            Ok(output.display().to_string())
+        }
+    };
     let outcome = match cli.wayland_socket.as_deref() {
-        Some(path) => lisnap_platform::run_wayland_editor_socket(Path::new(path), &frame),
-        None => lisnap_platform::run_wayland_editor(&frame),
+        Some(path) => lisnap_platform::run_wayland_editor_socket_with_output(Path::new(path), &frame, &mut output),
+        None => lisnap_platform::run_wayland_editor_with_output(&frame, &mut output),
     }
     .map_err(|error| error.to_string())?;
 
     match outcome {
-        lisnap_platform::WaylandEditorOutcome::Accepted { selection, image, copy } => {
-            if copy {
-                copy_png_to_clipboard(&image)?;
-                println!("Copied {}x{} annotated capture from {} to clipboard", selection.width, selection.height, frame.screen.id);
-            } else {
-                let output = cli.output_path.as_deref().map(PathBuf::from).unwrap_or_else(default_output_path);
-                save_png(&output, &image)?;
-                println!(
-                    "Saved {}x{} annotated capture from {} at {},{} to {}",
-                    selection.width, selection.height, frame.screen.id, selection.x, selection.y, output.display()
-                );
-            }
-            Ok(())
-        }
+        // The output callback already saved/copied the image and the editor
+        // displayed its result. Do not perform the operation a second time.
+        lisnap_platform::WaylandEditorOutcome::Accepted { .. } => Ok(()),
         lisnap_platform::WaylandEditorOutcome::Cancelled => Ok(()),
         lisnap_platform::WaylandEditorOutcome::Closed => {
             Err("Wayland compositor closed the interactive screenshot editor".into())
@@ -205,16 +217,26 @@ fn copy_png_to_clipboard(image: &lisnap_core::RgbaImage) -> Result<(), String> {
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(|e| format!("PNG clipboard header failed: {e}"))?;
         writer.write_image_data(image.pixels()).map_err(|e| format!("PNG clipboard encoding failed: {e}"))?;
+        writer.finish().map_err(|e| format!("finishing PNG clipboard encoding failed: {e}"))?;
     }
     let mut child = Command::new("wl-copy")
         .args(["--type", "image/png"])
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("starting wl-copy failed: {e}; install gui-apps/wl-clipboard"))?;
-    child.stdin.take().ok_or("wl-copy has no stdin")?
-        .write_all(&png_bytes).map_err(|e| format!("sending PNG to clipboard failed: {e}"))?;
-    let status = child.wait().map_err(|e| format!("waiting for wl-copy failed: {e}"))?;
-    if !status.success() { return Err(format!("wl-copy exited with {status}")); }
+    let transfer = child
+        .stdin
+        .take()
+        .ok_or("wl-copy has no stdin")?
+        .write_all(&png_bytes)
+        .map_err(|e| format!("sending PNG to clipboard failed: {e}"));
+    // Reap wl-copy even if the pipe write failed, since the editor can retry.
+    let status = child.wait().map_err(|e| format!("waiting for wl-copy failed: {e}"));
+    transfer?;
+    let status = status?;
+    if !status.success() {
+        return Err(format!("wl-copy exited with {status}"));
+    }
     Ok(())
 }
 
@@ -241,7 +263,8 @@ fn save_png(path: &Path, image: &lisnap_core::RgbaImage) -> Result<(), String> {
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(|error| format!("writing PNG header failed: {error}"))?;
-    writer.write_image_data(image.pixels()).map_err(|error| format!("writing PNG pixels failed: {error}"))
+    writer.write_image_data(image.pixels()).map_err(|error| format!("writing PNG pixels failed: {error}"))?;
+    writer.finish().map_err(|error| format!("finishing PNG file failed: {error}"))
 }
 
 fn list_screens(kind: Option<BackendKind>) -> Result<(), String> {
@@ -524,6 +547,32 @@ fn launch_gui(_kind: Option<BackendKind>, _include_cursor: bool) -> Result<(), S
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_png_finishes_file_before_reporting_success() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory =
+            std::env::temp_dir().join("opencode").join(format!("lisnap-save-{}-{unique}", std::process::id()));
+        let path = directory.join("capture.png");
+        let image =
+            lisnap_core::RgbaImage::new(lisnap_core::PixelSize { width: 1, height: 1 }, vec![10, 20, 30, 255]).unwrap();
+        save_png(&path, &image).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.ends_with(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 174, 66, 96, 130]));
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(pixels, image.pixels());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn save_png_does_not_report_success_when_buffered_output_cannot_be_flushed() {
+        let image =
+            lisnap_core::RgbaImage::new(lisnap_core::PixelSize { width: 1, height: 1 }, vec![10, 20, 30, 255]).unwrap();
+        assert!(save_png(Path::new("/dev/full"), &image).is_err());
+    }
 
     #[test]
     fn command_line_cursor_override_takes_priority_over_persisted_settings() {

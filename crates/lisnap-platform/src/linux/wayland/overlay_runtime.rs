@@ -9,16 +9,21 @@ use std::{
 
 use lisnap_core::{CaptureError, CaptureFrame, LogicalRect, PixelRect, PixelSize, RgbaImage, selection_to_pixels};
 
+use super::WaylandEditorOutputHandler;
 use super::annotation::{
     Annotation, ArrowHandle, CONTEXT_MENU_SIZE, CUSTOM_DRAG_HUE, CUSTOM_DRAG_SV, CUSTOM_HUE_ID, CUSTOM_SV_ID,
     ContextMenu, ContextMenuKind, CustomColorEditor, DEFAULT_COLOR, DraftAnnotation, EditorTool, MosaicSource, PALETTE,
-    RectI as AnnotationRect, TextDraft, ToolbarAction, annotation_damage_regions, annotation_hit_test,
-    arrow_handle_hit_test, color_menu_layout, compose_annotated_crop, context_menu_layout, custom_color_menu_layout,
-    custom_hue_at, custom_sat_value_at, custom_slider_value, draft_damage_regions, key_to_ascii, normalized_rect,
-    preload_system_font, render_annotations_patch_with_source, render_context_menu_patch, render_draft_patch_with_move,
-    render_toolbar_patch_with_color, selected_annotation_damage, selected_annotation_hit_test, toolbar_layout,
-    translate_annotation_in_selection,
+    RectI as AnnotationRect, SELECTION_DIMENSIONS_SIZE, SelectionDimensions, TextDraft, ToolbarAction,
+    annotation_damage_regions, annotation_hit_test, arrow_handle_hit_test, color_menu_layout, compose_annotated_crop,
+    context_menu_layout, custom_color_menu_layout, custom_hue_at, custom_sat_value_at, custom_slider_value,
+    draft_damage_regions, key_to_ascii, normalized_rect, preload_system_font, render_annotations_patch_with_source,
+    render_context_menu_patch, render_draft_patch_with_move, render_feedback_patch, render_magnifier_patch,
+    render_selection_dimensions_patch, render_toolbar_patch_with_color, selected_annotation_damage,
+    selected_annotation_hit_test, selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
 };
+use super::feedback::{EditorFeedback, FEEDBACK_SIZE, feedback_layout};
+use super::magnifier::{MAGNIFIER_SIZE, magnifier_preview};
+use super::selection::{ResizeHandle, resize_handle_rects, resize_hit_test, resized_selection};
 use rustix::{
     event::{PollFd, PollFlags, poll},
     fs::{MemfdFlags, memfd_create},
@@ -58,9 +63,11 @@ const RIGHT_CTRL_KEY: u32 = 97;
 const Z_KEY: u32 = 44;
 const Y_KEY: u32 = 21;
 const A_KEY: u32 = 30;
+const M_KEY: u32 = 50;
 const DELETE_KEY: u32 = 111;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TEXT_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const OUTPUT_CONFIRMATION_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrozenOverlayOutcome {
@@ -80,6 +87,7 @@ pub(crate) enum EditorOverlayOutcome {
 enum RuntimeOutcome {
     Selected(PixelRect),
     Accepted { selection: PixelRect, logical_size: PixelSize, annotations: Vec<Annotation>, copy: bool },
+    Completed { selection: PixelRect, image: RgbaImage, copy: bool },
     Cancelled,
     Closed,
 }
@@ -110,13 +118,19 @@ struct OverlayVisuals {
     parent: wl_surface::WlSurface,
     mask_quads: Vec<OverlayQuad>,
     border_quads: Vec<OverlayQuad>,
+    handle_quads: Vec<OverlayQuad>,
     mask_buffer: wl_buffer::WlBuffer,
     border_buffer: wl_buffer::WlBuffer,
+    dimensions_layer: EditorLayer,
+    pending_dimensions: Option<SelectionDimensions>,
     _solid_file: File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorLayerKind {
+    Dimensions,
+    Magnifier,
+    Feedback,
     Static,
     Draft,
     Toolbar,
@@ -167,6 +181,89 @@ struct EditorSurfaces {
     menu_layer: EditorLayer,
 }
 
+#[derive(Debug)]
+struct CompletionToast {
+    surface: wl_surface::WlSurface,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    viewport: wp_viewport::WpViewport,
+    buffer: wl_buffer::WlBuffer,
+    size: PixelSize,
+    configured: bool,
+    _file: File,
+}
+
+#[derive(Debug)]
+struct CompletionToastData;
+
+impl CompletionToast {
+    fn new(
+        factory: &EditorLayerFactory<'_>,
+        layer_shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        output: &wl_output::WlOutput,
+        viewporter: &wp_viewporter::WpViewporter,
+        screen: PixelSize,
+    ) -> Result<Self, CaptureError> {
+        let bounds = feedback_layout(screen);
+        let surface = factory.compositor.create_surface(factory.queue_handle, ());
+        let input = factory.compositor.create_region(factory.queue_handle, ());
+        surface.set_input_region(Some(&input));
+        input.destroy();
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            Some(output),
+            zwlr_layer_shell_v1::Layer::Overlay,
+            "lisnap-feedback".into(),
+            factory.queue_handle,
+            CompletionToastData,
+        );
+        layer_surface.set_size(bounds.width as u32, bounds.height as u32);
+        layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+        layer_surface.set_margin(bounds.y, 0, 0, 0);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+
+        // Only the small toast is mapped, with a transparent one-pixel parent.
+        // No full-screen screenshot buffer or input grab survives the transition.
+        let name = CString::new("lisnap-feedback-parent")
+            .map_err(|_| CaptureError::BackendFailure("invalid feedback memfd name".into()))?;
+        let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+            .map_err(|error| CaptureError::BackendFailure(format!("feedback memfd_create failed: {error}")))?;
+        let mut file = File::from(fd);
+        file.set_len(4)
+            .map_err(|error| CaptureError::BackendFailure(format!("resizing feedback SHM failed: {error}")))?;
+        file.write_all(&[0; 4])
+            .map_err(|error| CaptureError::BackendFailure(format!("writing feedback SHM failed: {error}")))?;
+        let pool = factory.shm.create_pool(file.as_fd(), 4, factory.queue_handle, ());
+        let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, factory.queue_handle, ());
+        pool.destroy();
+        let viewport = viewporter.get_viewport(&surface, factory.queue_handle, ());
+        viewport.set_destination(bounds.width, bounds.height);
+        surface.commit();
+        Ok(Self {
+            surface,
+            layer_surface,
+            viewport,
+            buffer,
+            size: PixelSize { width: bounds.width as u32, height: bounds.height as u32 },
+            configured: false,
+            _file: file,
+        })
+    }
+
+    fn commit(&self) {
+        self.surface.attach(Some(&self.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, 1, 1);
+        self.surface.commit();
+    }
+
+    fn destroy(self) {
+        self.viewport.destroy();
+        self.buffer.destroy();
+        self.layer_surface.destroy();
+        self.surface.destroy();
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CanvasBufferData {
     layer: EditorLayerKind,
@@ -195,11 +292,20 @@ struct EditingExistingText {
     before: Annotation,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SelectionResize {
+    handle: ResizeHandle,
+    anchor: (f64, f64),
+    before: AnnotationRect,
+    before_pixels: PixelRect,
+}
+
 #[derive(Debug, Clone)]
 enum EditOperation {
     Added { index: usize, annotation: Annotation },
     Changed { index: usize, before: Annotation, after: Annotation },
     Deleted { index: usize, annotation: Annotation },
+    SelectionResized { before: (AnnotationRect, PixelRect), after: (AnnotationRect, PixelRect) },
 }
 
 #[derive(Debug, Default)]
@@ -228,6 +334,7 @@ struct RuntimeState {
     logical_size: Option<PixelSize>,
     frame_size: Option<PixelSize>,
     pointer_position: Option<(f64, f64)>,
+    pointer_enter_serial: Option<u32>,
     drag_anchor: Option<(f64, f64)>,
     outcome: Option<RuntimeOutcome>,
     visuals: Option<OverlayVisuals>,
@@ -235,6 +342,8 @@ struct RuntimeState {
     editing: bool,
     selection_logical: Option<AnnotationRect>,
     selection_pixels: Option<PixelRect>,
+    resizing: Option<SelectionResize>,
+    selection_visuals_dirty: bool,
     active_tool: EditorTool,
     annotations: Vec<Annotation>,
     selected_annotation: Option<usize>,
@@ -244,6 +353,19 @@ struct RuntimeState {
     redo_operations: Vec<EditOperation>,
     moving: Option<MovingAnnotation>,
     mosaic_source: Option<MosaicSource>,
+    magnifier_layer: Option<EditorLayer>,
+    magnifier_enabled: bool,
+    magnifier_visible: bool,
+    magnifier_dirty: bool,
+    feedback_layer: Option<EditorLayer>,
+    feedback: Option<EditorFeedback>,
+    feedback_dirty: bool,
+    editor_surface: Option<wl_surface::WlSurface>,
+    editor_layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    editor_output: Option<wl_output::WlOutput>,
+    completion_toast: Option<CompletionToast>,
+    pending_completion: Option<RuntimeOutcome>,
+    completion_deadline: Option<Instant>,
     draft_annotation: Option<DraftAnnotation>,
     text_draft: Option<TextDraft>,
     stroke_width: i32,
@@ -303,9 +425,30 @@ impl OverlayVisuals {
             mask_quads.push(Self::create_quad(compositor, subcompositor, viewporter, parent, queue_handle));
             border_quads.push(Self::create_quad(compositor, subcompositor, viewporter, parent, queue_handle));
         }
+        let handle_quads: Vec<_> =
+            (0..8).map(|_| Self::create_quad(compositor, subcompositor, viewporter, parent, queue_handle)).collect();
 
-        let visuals =
-            Self { parent: parent.clone(), mask_quads, border_quads, mask_buffer, border_buffer, _solid_file: file };
+        let factory = EditorLayerFactory {
+            compositor,
+            subcompositor,
+            shm,
+            parent,
+            size: SELECTION_DIMENSIONS_SIZE,
+            queue_handle,
+        };
+        let dimensions_layer =
+            EditorLayer::new(EditorLayerKind::Dimensions, &factory, handle_quads.last().map(|quad| &quad.surface))?;
+        let visuals = Self {
+            parent: parent.clone(),
+            mask_quads,
+            border_quads,
+            handle_quads,
+            mask_buffer,
+            border_buffer,
+            dimensions_layer,
+            pending_dimensions: None,
+            _solid_file: file,
+        };
         visuals.update_selection(None, None, logical_size);
         Ok(visuals)
     }
@@ -359,6 +502,26 @@ impl OverlayVisuals {
         for quad in &self.border_quads {
             self.hide_quad(quad);
         }
+        for quad in &self.handle_quads {
+            self.hide_quad(quad);
+        }
+    }
+
+    fn update_resize_handles(&self, selection: Option<AnnotationRect>, screen: PixelSize) {
+        if let Some(selection) = selection {
+            for (quad, rect) in self.handle_quads.iter().zip(resize_handle_rects(selection, screen)) {
+                self.set_quad(
+                    quad,
+                    &self.border_buffer,
+                    RectI { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                );
+            }
+        } else {
+            for quad in &self.handle_quads {
+                self.hide_quad(quad);
+            }
+        }
+        self.parent.commit();
     }
 
     fn set_quad(&self, quad: &OverlayQuad, buffer: &wl_buffer::WlBuffer, rect: RectI) {
@@ -378,12 +541,40 @@ impl OverlayVisuals {
         quad.surface.commit();
     }
 
-    fn top_surface(&self) -> Option<&wl_surface::WlSurface> {
-        self.border_quads.last().map(|quad| &quad.surface).or_else(|| self.mask_quads.last().map(|quad| &quad.surface))
+    fn top_surface(&self) -> &wl_surface::WlSurface {
+        &self.dimensions_layer.surface
+    }
+
+    fn update_dimensions(&mut self, dimensions: Option<SelectionDimensions>) -> Result<(), CaptureError> {
+        self.pending_dimensions = dimensions;
+        if self.pending_dimensions.is_none() {
+            self.dimensions_layer.surface.attach(None, 0, 0);
+            self.dimensions_layer.surface.commit();
+            self.parent.commit();
+        }
+        self.redraw_dimensions()
+    }
+
+    fn redraw_dimensions(&mut self) -> Result<(), CaptureError> {
+        let Some(dimensions) = self.pending_dimensions.as_ref() else {
+            return Ok(());
+        };
+        if !self.dimensions_layer.has_available_buffer() {
+            return Ok(());
+        }
+        let pixels = render_selection_dimensions_patch(dimensions);
+        let region = AnnotationRect { x: 0, y: 0, ..dimensions.bounds };
+        if self.dimensions_layer.redraw_patch(region, &pixels)? {
+            self.dimensions_layer.subsurface.set_position(dimensions.bounds.x, dimensions.bounds.y);
+            self.parent.commit();
+            self.pending_dimensions = None;
+        }
+        Ok(())
     }
 
     fn destroy(self) {
-        for quad in self.mask_quads.into_iter().chain(self.border_quads) {
+        self.dimensions_layer.destroy();
+        for quad in self.mask_quads.into_iter().chain(self.border_quads).chain(self.handle_quads) {
             quad.viewport.destroy();
             quad.subsurface.destroy();
             quad.surface.destroy();
@@ -574,6 +765,7 @@ impl EditorSurfaces {
 
     fn mark_released(&mut self, layer: EditorLayerKind, slot: usize) {
         match layer {
+            EditorLayerKind::Dimensions | EditorLayerKind::Magnifier | EditorLayerKind::Feedback => {}
             EditorLayerKind::Static => self.static_layer.mark_released(slot),
             EditorLayerKind::Draft => self.draft_layer.mark_released(slot),
             EditorLayerKind::Toolbar => self.toolbar_layer.mark_released(slot),
@@ -674,11 +866,11 @@ pub(crate) fn run_connection(
     connection: Connection,
     frame: &CaptureFrame,
 ) -> Result<FrozenOverlayOutcome, CaptureError> {
-    match run_connection_mode(connection, frame, false)? {
+    match run_connection_mode(connection, frame, false, None)? {
         RuntimeOutcome::Selected(selection) => Ok(FrozenOverlayOutcome::Selected(selection)),
         RuntimeOutcome::Cancelled => Ok(FrozenOverlayOutcome::Cancelled),
         RuntimeOutcome::Closed => Ok(FrozenOverlayOutcome::Closed),
-        RuntimeOutcome::Accepted { .. } => {
+        RuntimeOutcome::Accepted { .. } | RuntimeOutcome::Completed { .. } => {
             Err(CaptureError::BackendFailure("selection overlay unexpectedly returned an editor result".into()))
         }
     }
@@ -687,13 +879,17 @@ pub(crate) fn run_connection(
 pub(crate) fn run_editor_connection(
     connection: Connection,
     frame: &CaptureFrame,
+    output: Option<&mut WaylandEditorOutputHandler<'_>>,
 ) -> Result<EditorOverlayOutcome, CaptureError> {
-    match run_connection_mode(connection, frame, true)? {
+    match run_connection_mode(connection, frame, true, output)? {
         RuntimeOutcome::Accepted { selection, logical_size, annotations, copy } => Ok(EditorOverlayOutcome::Accepted {
             selection,
             image: compose_annotated_crop(frame, logical_size, selection, &annotations)?,
             copy,
         }),
+        RuntimeOutcome::Completed { selection, image, copy } => {
+            Ok(EditorOverlayOutcome::Accepted { selection, image, copy })
+        }
         RuntimeOutcome::Cancelled => Ok(EditorOverlayOutcome::Cancelled),
         RuntimeOutcome::Closed => Ok(EditorOverlayOutcome::Closed),
         RuntimeOutcome::Selected(_) => {
@@ -706,6 +902,7 @@ fn run_connection_mode(
     connection: Connection,
     frame: &CaptureFrame,
     editor_enabled: bool,
+    output_handler: Option<&mut WaylandEditorOutputHandler<'_>>,
 ) -> Result<RuntimeOutcome, CaptureError> {
     if editor_enabled {
         preload_system_font();
@@ -716,6 +913,7 @@ fn run_connection_mode(
     let _registry = display.get_registry(&queue_handle, ());
     let mut state = RuntimeState {
         editor_enabled,
+        magnifier_enabled: true,
         stroke_width: 3,
         font_size: 24,
         mosaic_block_size: 18,
@@ -776,6 +974,9 @@ fn run_connection_mode(
     );
     layer_surface.set_exclusive_zone(-1);
     layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
+    state.editor_surface = Some(surface.clone());
+    state.editor_layer_surface = Some(layer_surface.clone());
+    state.editor_output = Some(output.clone());
     surface.commit();
 
     let (serial, logical_width, logical_height) =
@@ -787,12 +988,10 @@ fn run_connection_mode(
     }
     layer_surface.ack_configure(serial);
     state.logical_size = Some(PixelSize { width: logical_width, height: logical_height });
-    if editor_enabled {
-        state.mosaic_source = Some(MosaicSource {
-            image: frame.image.clone(),
-            logical_size: PixelSize { width: logical_width, height: logical_height },
-        });
-    }
+    state.mosaic_source = Some(MosaicSource {
+        image: frame.image.clone(),
+        logical_size: PixelSize { width: logical_width, height: logical_height },
+    });
 
     let frame_size = frame.image.size();
     state.frame_size = Some(frame_size);
@@ -854,7 +1053,7 @@ fn run_connection_mode(
         &queue_handle,
     )?);
     if editor_enabled {
-        let stack_above = state.visuals.as_ref().and_then(OverlayVisuals::top_surface).cloned();
+        let stack_above = state.visuals.as_ref().map(|visuals| visuals.top_surface().clone());
         state.editor_surfaces = Some(EditorSurfaces::new(
             &compositor,
             &subcompositor,
@@ -865,11 +1064,33 @@ fn run_connection_mode(
             &queue_handle,
         )?);
     }
+    let magnifier_factory = EditorLayerFactory {
+        compositor: &compositor,
+        subcompositor: &subcompositor,
+        shm: &shm,
+        parent: &surface,
+        size: MAGNIFIER_SIZE,
+        queue_handle: &queue_handle,
+    };
+    let stack_above = state
+        .editor_surfaces
+        .as_ref()
+        .map(|surfaces| &surfaces.menu_layer.surface)
+        .or_else(|| state.visuals.as_ref().map(OverlayVisuals::top_surface));
+    state.magnifier_layer = Some(EditorLayer::new(EditorLayerKind::Magnifier, &magnifier_factory, stack_above)?);
+    if editor_enabled {
+        let factory = EditorLayerFactory { size: FEEDBACK_SIZE, ..magnifier_factory };
+        let stack_above = state.magnifier_layer.as_ref().map(|layer| &layer.surface);
+        state.feedback_layer = Some(EditorLayer::new(EditorLayerKind::Feedback, &factory, stack_above)?);
+    }
+    surface.commit();
+    state.magnifier_dirty = true;
+    redraw_magnifier(&mut state, &connection);
     event_queue
         .flush()
         .map_err(|error| CaptureError::BackendFailure(format!("mapping Wayland overlay failed: {error}")))?;
 
-    let outcome = run_input_loop(&mut event_queue, &mut state, &connection);
+    let outcome = run_input_loop(&mut event_queue, &mut state, &connection, frame, output_handler);
 
     if let Some(text_input) = state.text_input.take() {
         if state.text_input_enabled {
@@ -877,6 +1098,15 @@ fn run_connection_mode(
             text_input.commit();
         }
         text_input.destroy();
+    }
+    if let Some(feedback) = state.feedback_layer.take() {
+        feedback.destroy();
+    }
+    if let Some(toast) = state.completion_toast.take() {
+        toast.destroy();
+    }
+    if let Some(magnifier) = state.magnifier_layer.take() {
+        magnifier.destroy();
     }
     if let Some(editor_surfaces) = state.editor_surfaces.take() {
         editor_surfaces.destroy();
@@ -909,28 +1139,49 @@ fn run_input_loop(
     event_queue: &mut wayland_client::EventQueue<RuntimeState>,
     state: &mut RuntimeState,
     connection: &Connection,
+    frame: &CaptureFrame,
+    mut output: Option<&mut WaylandEditorOutputHandler<'_>>,
 ) -> Result<RuntimeOutcome, CaptureError> {
     loop {
         if let Some(error) = state.runtime_error.take() {
             return Err(error);
         }
         if let Some(outcome) = state.outcome.take() {
+            if matches!(outcome, RuntimeOutcome::Accepted { .. })
+                && let Some(output) = output.as_mut()
+            {
+                execute_editor_output(state, frame, outcome, *output);
+                if state.pending_completion.is_some() {
+                    release_editor_for_confirmation(state, &event_queue.handle(), connection)?;
+                }
+                redraw_editor(state, connection);
+                continue;
+            }
+            return Ok(outcome);
+        }
+        if let Some(outcome) = take_confirmed_output(state, Instant::now()) {
             return Ok(outcome);
         }
         if state.closed {
-            return Ok(RuntimeOutcome::Closed);
+            return Ok(state.pending_completion.take().unwrap_or(RuntimeOutcome::Closed));
         }
 
-        if let Some(deadline) = state.text_cursor_blink_at {
+        let deadline = match (state.text_cursor_blink_at, state.completion_deadline) {
+            (Some(blink), Some(completion)) => Some(blink.min(completion)),
+            (blink, completion) => blink.or(completion),
+        };
+        if let Some(deadline) = deadline {
             match dispatch_with_deadline(event_queue, state, deadline, "Wayland overlay input dispatch") {
                 Ok(()) => {}
                 Err(CaptureError::Timeout) => {
-                    if state.text_draft.is_some() {
+                    if state.text_cursor_blink_at.is_some_and(|blink| Instant::now() >= blink)
+                        && state.text_draft.is_some()
+                    {
                         state.text_cursor_visible = !state.text_cursor_visible;
                         state.text_cursor_blink_at = Some(Instant::now() + TEXT_CURSOR_BLINK_INTERVAL);
                         state.draft_dirty = true;
                         redraw_editor(state, connection);
-                    } else {
+                    } else if state.text_draft.is_none() {
                         state.text_cursor_visible = false;
                         state.text_cursor_blink_at = None;
                     }
@@ -943,6 +1194,125 @@ fn run_input_loop(
             })?;
         }
     }
+}
+
+fn execute_editor_output(
+    state: &mut RuntimeState,
+    frame: &CaptureFrame,
+    outcome: RuntimeOutcome,
+    output: &mut WaylandEditorOutputHandler<'_>,
+) {
+    let RuntimeOutcome::Accepted { selection, logical_size, annotations, copy } = outcome else {
+        return;
+    };
+    let result = compose_annotated_crop(frame, logical_size, selection, &annotations)
+        .map_err(|error| error.to_string())
+        .and_then(|image| output(selection, &image, copy).map(|detail| (image, detail)));
+    state.completion_deadline = None;
+    stop_text_cursor_blink(state);
+    state.feedback_dirty = true;
+    match result {
+        Ok((image, detail)) => {
+            state.feedback = Some(EditorFeedback { copy, failed: false, detail });
+            state.pending_completion = Some(RuntimeOutcome::Completed { selection, image, copy });
+        }
+        Err(detail) => {
+            state.feedback = Some(EditorFeedback { copy, failed: true, detail });
+            state.pending_completion = None;
+        }
+    }
+}
+
+fn take_confirmed_output(state: &mut RuntimeState, now: Instant) -> Option<RuntimeOutcome> {
+    if state.completion_deadline.is_none_or(|deadline| now < deadline) {
+        return None;
+    }
+    state.completion_deadline = None;
+    state.pending_completion.take()
+}
+
+fn release_editor_for_confirmation(
+    state: &mut RuntimeState,
+    queue_handle: &QueueHandle<RuntimeState>,
+    connection: &Connection,
+) -> Result<(), CaptureError> {
+    if state.pending_completion.is_none() || state.completion_toast.is_some() {
+        return Ok(());
+    }
+    let (
+        Some(compositor),
+        Some(subcompositor),
+        Some(shm),
+        Some(layer_shell),
+        Some(viewporter),
+        Some(output),
+        Some(screen),
+        Some(parent),
+    ) = (
+        state.compositor.as_ref(),
+        state.subcompositor.as_ref(),
+        state.shm.as_ref(),
+        state.layer_shell.as_ref(),
+        state.viewporter.as_ref(),
+        state.editor_output.as_ref(),
+        state.logical_size,
+        state.editor_surface.as_ref(),
+    )
+    else {
+        return Err(CaptureError::BackendFailure("missing Wayland objects for output confirmation".into()));
+    };
+    let factory = EditorLayerFactory { compositor, subcompositor, shm, parent, size: FEEDBACK_SIZE, queue_handle };
+    let toast = CompletionToast::new(&factory, layer_shell, output, viewporter, screen)?;
+    let toast_factory = EditorLayerFactory { parent: &toast.surface, ..factory };
+    let feedback_layer = EditorLayer::new(EditorLayerKind::Feedback, &toast_factory, None)?;
+
+    // Unmap the frozen capture and release exclusive focus in the same commit.
+    // The new toast has no pointer input region and never requests keyboard focus.
+    if let Some(layer_surface) = state.editor_layer_surface.as_ref() {
+        layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    }
+    parent.attach(None, 0, 0);
+    parent.commit();
+    if let Some(text_input) = state.text_input.take() {
+        if state.text_input_enabled {
+            text_input.disable();
+            text_input.commit();
+        }
+        text_input.destroy();
+    }
+    if let Some(layer) = state.feedback_layer.replace(feedback_layer) {
+        layer.destroy();
+    }
+    if let Some(surfaces) = state.editor_surfaces.take() {
+        surfaces.destroy();
+    }
+    if let Some(layer) = state.magnifier_layer.take() {
+        layer.destroy();
+    }
+    if let Some(visuals) = state.visuals.take() {
+        visuals.destroy();
+    }
+    state.completion_toast = Some(toast);
+    finish_editor_interaction(state);
+    connection
+        .flush()
+        .map_err(|error| CaptureError::BackendFailure(format!("releasing screenshot editor failed: {error}")))
+}
+
+fn finish_editor_interaction(state: &mut RuntimeState) {
+    state.editing = false;
+    state.text_input_enabled = false;
+    state.text_input_focus = false;
+    state.pointer_position = None;
+    state.pointer_enter_serial = None;
+    state.drag_anchor = None;
+    state.resizing = None;
+    state.moving = None;
+    state.mosaic_source = None;
+    state.draft_annotation = None;
+    state.context_menu = None;
+    state.magnifier_visible = false;
+    stop_text_cursor_blink(state);
 }
 
 fn reset_text_cursor_blink(state: &mut RuntimeState) {
@@ -987,6 +1357,44 @@ fn pointer_selection(
         LogicalRect { x: 0.0, y: 0.0, width: f64::from(logical_size.width), height: f64::from(logical_size.height) },
         frame_size,
     )
+}
+
+fn selection_dimensions(
+    start: (f64, f64),
+    end: (f64, f64),
+    logical_size: PixelSize,
+    frame_size: PixelSize,
+) -> Option<SelectionDimensions> {
+    let selection = normalized_rect(start, end, logical_size)?;
+    let pixels = pointer_selection(start, end, logical_size, frame_size)?;
+    Some(selection_dimensions_layout(selection, pixels, logical_size))
+}
+
+fn update_selection_visuals(
+    state: &mut RuntimeState,
+    start: Option<(f64, f64)>,
+    end: Option<(f64, f64)>,
+    connection: &Connection,
+) {
+    let (Some(logical_size), Some(frame_size), Some(visuals)) =
+        (state.logical_size, state.frame_size, state.visuals.as_mut())
+    else {
+        return;
+    };
+    visuals.update_selection(start, end, logical_size);
+    visuals.update_resize_handles(if state.editing { state.selection_logical } else { None }, logical_size);
+    let dimensions = if state.editing {
+        state
+            .selection_logical
+            .zip(state.selection_pixels)
+            .map(|(selection, pixels)| selection_dimensions_layout(selection, pixels, logical_size))
+    } else {
+        start.zip(end).and_then(|(start, end)| selection_dimensions(start, end, logical_size, frame_size))
+    };
+    if let Err(error) = visuals.update_dimensions(dimensions) {
+        state.runtime_error = Some(error);
+    }
+    let _ = connection.flush();
 }
 
 fn commit_text_input_request(state: &mut RuntimeState, text_input: &zwp_text_input_v3::ZwpTextInputV3) {
@@ -1089,9 +1497,137 @@ fn apply_text_input_done(state: &mut RuntimeState, serial: u32, connection: &Con
     redraw_editor(state, connection);
 }
 
+fn should_show_magnifier(state: &RuntimeState) -> bool {
+    if !state.magnifier_enabled || state.pointer_position.is_none() || state.feedback.is_some() {
+        return false;
+    }
+    if !state.editing {
+        return true;
+    }
+    if state.context_menu.is_some()
+        || state.text_draft.is_some()
+        || state.draft_annotation.is_some()
+        || state.moving.is_some()
+    {
+        return false;
+    }
+    if let (Some(selection), Some(screen), Some(point)) =
+        (state.selection_logical, state.logical_size, state.pointer_position)
+        && toolbar_layout(selection, screen).bounds.contains(point)
+    {
+        return false;
+    }
+    true
+}
+
+fn redraw_magnifier(state: &mut RuntimeState, connection: &Connection) {
+    let visible = should_show_magnifier(state);
+    let Some(layer) = state.magnifier_layer.as_mut() else {
+        return;
+    };
+    if !visible {
+        if state.magnifier_visible {
+            layer.surface.attach(None, 0, 0);
+            layer.surface.commit();
+            if let Some(visuals) = state.visuals.as_ref() {
+                visuals.parent.commit();
+            }
+            let _ = connection.flush();
+        }
+        state.magnifier_visible = false;
+        state.magnifier_dirty = false;
+        return;
+    }
+    if (state.magnifier_visible && !state.magnifier_dirty) || !layer.has_available_buffer() {
+        return;
+    }
+    let (Some(source), Some(point)) = (state.mosaic_source.as_ref(), state.pointer_position) else {
+        return;
+    };
+    let Some(preview) = magnifier_preview(&source.image, source.logical_size, point) else {
+        return;
+    };
+    let pixels = render_magnifier_patch(&preview);
+    let region = AnnotationRect { x: 0, y: 0, ..preview.bounds };
+    match layer.redraw_patch(region, &pixels) {
+        Ok(true) => {
+            layer.subsurface.set_position(preview.bounds.x, preview.bounds.y);
+            state.magnifier_visible = true;
+            state.magnifier_dirty = false;
+            if let Some(visuals) = state.visuals.as_ref() {
+                visuals.parent.commit();
+            }
+            if let Err(error) = connection.flush() {
+                state.runtime_error =
+                    Some(CaptureError::BackendFailure(format!("flushing pixel magnifier failed: {error}")));
+            }
+        }
+        Ok(false) => {}
+        Err(error) => state.runtime_error = Some(error),
+    }
+}
+
+fn can_toggle_magnifier(state: &RuntimeState) -> bool {
+    !state.ctrl_pressed
+        && state.text_draft.is_none()
+        && !state.context_menu.as_ref().is_some_and(|menu| menu.kind == ContextMenuKind::CustomColor)
+}
+
+fn redraw_feedback(state: &mut RuntimeState, connection: &Connection) {
+    if !state.feedback_dirty {
+        return;
+    }
+    if state.completion_toast.as_ref().is_some_and(|toast| !toast.configured) {
+        return;
+    }
+    let (Some(feedback), Some(screen), Some(layer)) =
+        (state.feedback.as_ref(), state.logical_size, state.feedback_layer.as_mut())
+    else {
+        return;
+    };
+    if !layer.has_available_buffer() {
+        return;
+    }
+    let bounds = if let Some(toast) = state.completion_toast.as_ref() {
+        AnnotationRect { x: 0, y: 0, width: toast.size.width as i32, height: toast.size.height as i32 }
+    } else {
+        feedback_layout(screen)
+    };
+    let region = AnnotationRect { x: 0, y: 0, ..bounds };
+    let pixels = render_feedback_patch(bounds, feedback);
+    match layer.redraw_patch(region, &pixels) {
+        Ok(true) => {
+            layer.subsurface.set_position(bounds.x, bounds.y);
+            state.feedback_dirty = false;
+            if let Some(toast) = state.completion_toast.as_ref() {
+                toast.commit();
+            } else if let Some(visuals) = state.visuals.as_ref() {
+                visuals.parent.commit();
+            }
+            if let Err(error) = connection.flush() {
+                state.runtime_error =
+                    Some(CaptureError::BackendFailure(format!("flushing output feedback failed: {error}")));
+            } else if state.pending_completion.is_some() && state.completion_deadline.is_none() {
+                state.completion_deadline = Some(Instant::now() + OUTPUT_CONFIRMATION_DURATION);
+            }
+        }
+        Ok(false) => {}
+        Err(error) => state.runtime_error = Some(error),
+    }
+}
+
 fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
+    redraw_feedback(state, connection);
+    redraw_magnifier(state, connection);
     if !state.editor_enabled || !state.editing {
         return;
+    }
+    if state.selection_visuals_dirty {
+        if let Some(selection) = state.selection_logical {
+            let (start, end) = selection_corners(selection);
+            update_selection_visuals(state, Some(start), Some(end), connection);
+        }
+        state.selection_visuals_dirty = false;
     }
     update_text_input_activation(state, connection);
     let Some(selection) = state.selection_logical else {
@@ -1105,7 +1641,7 @@ fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
     };
 
     let mut parent_dirty = false;
-    if state.static_dirty {
+    if state.static_dirty && surfaces.static_layer.has_available_buffer() {
         let pixels = render_annotations_patch_with_source(selection, &state.annotations, state.mosaic_source.as_ref());
         match surfaces.static_layer.redraw_patch(selection, &pixels) {
             Ok(true) => {
@@ -1156,7 +1692,7 @@ fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
         }
     }
 
-    if state.toolbar_dirty && state.runtime_error.is_none() {
+    if state.toolbar_dirty && state.runtime_error.is_none() && surfaces.toolbar_layer.has_available_buffer() {
         let toolbar = toolbar_layout(selection, logical_size);
         let color = active_annotation_color(state);
         let pixels = render_toolbar_patch_with_color(&toolbar, state.active_tool, color);
@@ -1324,6 +1860,10 @@ fn apply_edit_operation(state: &mut RuntimeState, op: &EditOperation, forward: b
                 state.annotations.insert((*index).min(state.annotations.len()), annotation.clone());
             }
         }
+        EditOperation::SelectionResized { before, after } => {
+            let (selection, pixels) = if forward { *after } else { *before };
+            set_selection(state, selection, pixels);
+        }
     }
     state.selected_annotation = None;
     state.last_text_click = None;
@@ -1368,6 +1908,9 @@ fn redo_editor(state: &mut RuntimeState) {
 }
 
 fn accept_editor(state: &mut RuntimeState, copy: bool) {
+    if state.outcome.is_some() || state.pending_completion.is_some() {
+        return;
+    }
     commit_text_draft(state);
     if let (Some(selection), Some(logical_size)) = (state.selection_pixels, state.logical_size) {
         state.outcome =
@@ -1702,6 +2245,100 @@ fn text_draft_contains_point(draft: &TextDraft, point: (f64, f64)) -> bool {
     annotation_hit_test(&annotation, point)
 }
 
+fn selection_corners(selection: AnnotationRect) -> ((f64, f64), (f64, f64)) {
+    (
+        (f64::from(selection.x), f64::from(selection.y)),
+        (f64::from(selection.x + selection.width), f64::from(selection.y + selection.height)),
+    )
+}
+
+fn set_selection(state: &mut RuntimeState, selection: AnnotationRect, pixels: PixelRect) {
+    state.selection_logical = Some(selection);
+    state.selection_pixels = Some(pixels);
+    state.selection_visuals_dirty = true;
+    state.static_dirty |= !state.annotations.is_empty();
+    state.draft_dirty = true;
+    state.toolbar_dirty = true;
+}
+
+fn begin_selection_resize(state: &mut RuntimeState, point: (f64, f64)) -> bool {
+    let (Some(before), Some(before_pixels)) = (state.selection_logical, state.selection_pixels) else {
+        return false;
+    };
+    let Some(handle) = resize_hit_test(before, point) else {
+        return false;
+    };
+    commit_text_draft(state);
+    state.selected_annotation = None;
+    state.last_text_click = None;
+    state.draft_dirty = true;
+    state.drag_anchor = None;
+    state.resizing = Some(SelectionResize { handle, anchor: point, before, before_pixels });
+    true
+}
+
+fn update_selection_resize(state: &mut RuntimeState, point: (f64, f64)) {
+    let (Some(resize), Some(screen), Some(frame_size)) = (state.resizing, state.logical_size, state.frame_size) else {
+        return;
+    };
+    let selection = resized_selection(resize.before, resize.handle, resize.anchor, point, screen);
+    if state.selection_logical == Some(selection) {
+        return;
+    }
+    let (start, end) = selection_corners(selection);
+    if let Some(pixels) = pointer_selection(start, end, screen, frame_size) {
+        set_selection(state, selection, pixels);
+    }
+}
+
+fn finish_selection_resize(state: &mut RuntimeState) -> bool {
+    let Some(resize) = state.resizing.take() else {
+        return false;
+    };
+    if let (Some(selection), Some(pixels)) = (state.selection_logical, state.selection_pixels)
+        && (selection, pixels) != (resize.before, resize.before_pixels)
+    {
+        state.undo_operations.push(EditOperation::SelectionResized {
+            before: (resize.before, resize.before_pixels),
+            after: (selection, pixels),
+        });
+        state.redo_operations.clear();
+    }
+    true
+}
+
+fn cancel_selection_resize(state: &mut RuntimeState) {
+    if let Some(resize) = state.resizing.take() {
+        set_selection(state, resize.before, resize.before_pixels);
+    }
+}
+
+fn update_pointer_shape(state: &RuntimeState, point: (f64, f64)) {
+    let (Some(device), Some(serial)) = (state.cursor_shape_device.as_ref(), state.pointer_enter_serial) else {
+        return;
+    };
+    let handle = state.resizing.map(|resize| resize.handle).or_else(|| {
+        if !state.editing || state.context_menu.is_some() || state.draft_annotation.is_some() || state.moving.is_some()
+        {
+            return None;
+        }
+        let selection = state.selection_logical?;
+        if state.logical_size.is_some_and(|size| toolbar_layout(selection, size).bounds.contains(point)) {
+            return None;
+        }
+        resize_hit_test(selection, point)
+    });
+    use wp_cursor_shape_device_v1::Shape;
+    let shape = match handle {
+        Some(ResizeHandle::TopLeft | ResizeHandle::BottomRight) => Shape::NwseResize,
+        Some(ResizeHandle::TopRight | ResizeHandle::BottomLeft) => Shape::NeswResize,
+        Some(ResizeHandle::Left | ResizeHandle::Right) => Shape::EwResize,
+        Some(ResizeHandle::Top | ResizeHandle::Bottom) => Shape::NsResize,
+        None => Shape::Default,
+    };
+    device.set_shape(serial, shape);
+}
+
 fn begin_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection: &Connection) {
     if let Some(menu) = state.context_menu.as_ref() {
         let kind = menu.kind;
@@ -1732,6 +2369,10 @@ fn begin_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection:
         } else {
             handle_toolbar_action(state, action);
         }
+        redraw_editor(state, connection);
+        return;
+    }
+    if begin_selection_resize(state, point) {
         redraw_editor(state, connection);
         return;
     }
@@ -1819,6 +2460,11 @@ fn begin_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection:
 }
 
 fn update_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection: &Connection) {
+    if state.resizing.is_some() {
+        update_selection_resize(state, point);
+        redraw_editor(state, connection);
+        return;
+    }
     let Some(selection) = state.selection_logical else {
         return;
     };
@@ -1864,6 +2510,10 @@ fn update_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection
 
 fn finish_editor_pointer(state: &mut RuntimeState, connection: &Connection) {
     state.drag_anchor = None;
+    if finish_selection_resize(state) {
+        redraw_editor(state, connection);
+        return;
+    }
     if finish_annotation_move(state) {
         redraw_editor(state, connection);
         return;
@@ -1950,6 +2600,14 @@ fn handle_editor_key(state: &mut RuntimeState, key: u32, pressed: bool, connecti
             _ => {}
         }
         redraw_editor(state, connection);
+        return;
+    }
+
+    if state.resizing.is_some() {
+        if key == ESC_KEY {
+            cancel_selection_resize(state);
+            redraw_editor(state, connection);
+        }
         return;
     }
 
@@ -2311,11 +2969,27 @@ impl Dispatch<wl_seat::WlSeat, ()> for RuntimeState {
 }
 
 impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for RuntimeState {
-    fn event(_: &mut Self, _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, _: wp_cursor_shape_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _: wp_cursor_shape_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for RuntimeState {
-    fn event(_: &mut Self, _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, _: wp_cursor_shape_device_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        _: wp_cursor_shape_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
@@ -2327,16 +3001,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+        if state.pending_completion.is_some() {
+            return;
+        }
         if let wl_pointer::Event::Enter { serial, .. } = &event {
-            if let Some(device) = state.cursor_shape_device.as_ref() {
-                device.set_shape(*serial, wp_cursor_shape_device_v1::Shape::Default);
-            }
+            state.pointer_enter_serial = Some(*serial);
         }
         match event {
             wl_pointer::Event::Enter { surface_x, surface_y, .. }
             | wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
                 let current = (surface_x, surface_y);
                 state.pointer_position = Some(current);
+                update_pointer_shape(state, current);
                 if state.editing {
                     if let Some(channel) = state.custom_color_editor.as_ref().and_then(|editor| editor.dragging_channel)
                     {
@@ -2349,15 +3025,19 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                         if changed {
                             redraw_editor(state, connection);
                         }
-                    } else if state.draft_annotation.is_some() || state.moving.is_some() {
+                    } else if state.resizing.is_some() || state.draft_annotation.is_some() || state.moving.is_some() {
                         update_editor_pointer(state, current, connection);
                     }
-                } else if let (Some(anchor), Some(logical_size), Some(visuals)) =
-                    (state.drag_anchor, state.logical_size, state.visuals.as_ref())
-                {
-                    visuals.update_selection(Some(anchor), Some(current), logical_size);
-                    let _ = connection.flush();
+                } else if let Some(anchor) = state.drag_anchor {
+                    update_selection_visuals(state, Some(anchor), Some(current), connection);
                 }
+                state.magnifier_dirty = true;
+                redraw_magnifier(state, connection);
+            }
+            wl_pointer::Event::Leave { .. } => {
+                state.pointer_position = None;
+                state.pointer_enter_serial = None;
+                redraw_magnifier(state, connection);
             }
             wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. }
                 if button == BTN_RIGHT && button_state == wl_pointer::ButtonState::Pressed && state.editing =>
@@ -2376,10 +3056,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                             begin_editor_pointer(state, current, connection);
                         } else {
                             state.drag_anchor = Some(current);
-                            if let (Some(logical_size), Some(visuals)) = (state.logical_size, state.visuals.as_ref()) {
-                                visuals.update_selection(Some(current), Some(current), logical_size);
-                                let _ = connection.flush();
-                            }
+                            update_selection_visuals(state, Some(current), Some(current), connection);
                         }
                     }
                     wl_pointer::ButtonState::Released => {
@@ -2400,22 +3077,19 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
                             if let (Some(logical_selection), Some(pixel_selection)) =
                                 (logical_selection, pixel_selection)
                             {
-                                if let Some(visuals) = state.visuals.as_ref() {
-                                    visuals.update_selection(Some(anchor), Some(current), logical_size);
-                                    let _ = connection.flush();
-                                }
                                 if state.editor_enabled {
                                     state.editing = true;
                                     state.selection_logical = Some(logical_selection);
                                     state.selection_pixels = Some(pixel_selection);
                                     state.toolbar_dirty = true;
+                                    update_selection_visuals(state, Some(anchor), Some(current), connection);
                                     redraw_editor(state, connection);
                                 } else {
+                                    update_selection_visuals(state, Some(anchor), Some(current), connection);
                                     state.outcome = Some(RuntimeOutcome::Selected(pixel_selection));
                                 }
-                            } else if let Some(visuals) = state.visuals.as_ref() {
-                                visuals.update_selection(None, None, logical_size);
-                                let _ = connection.flush();
+                            } else {
+                                update_selection_visuals(state, None, None, connection);
                             }
                         }
                     }
@@ -2436,7 +3110,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+        if state.pending_completion.is_some() {
+            return;
+        }
         if let wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } = event {
+            if key == M_KEY && key_state == wl_keyboard::KeyState::Pressed && can_toggle_magnifier(state) {
+                state.magnifier_enabled = !state.magnifier_enabled;
+                state.magnifier_dirty = true;
+                redraw_magnifier(state, connection);
+                return;
+            }
             let pressed = matches!(key_state, wl_keyboard::KeyState::Pressed | wl_keyboard::KeyState::Repeated);
             if state.editor_enabled && state.editing {
                 handle_editor_key(state, key, pressed, connection);
@@ -2493,6 +3176,34 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
+            if data.layer == EditorLayerKind::Feedback {
+                if let Some(layer) = state.feedback_layer.as_mut() {
+                    // A retired editor feedback buffer can release after the
+                    // independent toast has replaced it. Never recycle its slot.
+                    if layer.buffers.get(data.slot).is_some_and(|buffer| buffer.buffer == *_proxy) {
+                        layer.mark_released(data.slot);
+                    }
+                }
+                redraw_feedback(state, connection);
+                return;
+            }
+            if data.layer == EditorLayerKind::Magnifier {
+                if let Some(layer) = state.magnifier_layer.as_mut() {
+                    layer.mark_released(data.slot);
+                }
+                redraw_magnifier(state, connection);
+                return;
+            }
+            if data.layer == EditorLayerKind::Dimensions {
+                if let Some(visuals) = state.visuals.as_mut() {
+                    visuals.dimensions_layer.mark_released(data.slot);
+                    if let Err(error) = visuals.redraw_dimensions() {
+                        state.runtime_error = Some(error);
+                    }
+                    let _ = connection.flush();
+                }
+                return;
+            }
             if let Some(surfaces) = state.editor_surfaces.as_mut() {
                 surfaces.mark_released(data.layer, data.slot);
             }
@@ -2607,9 +3318,41 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for RuntimeState {
             zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
                 state.configure = Some((serial, width, height));
             }
-            zwlr_layer_surface_v1::Event::Closed => {
-                state.closed = true;
+            zwlr_layer_surface_v1::Event::Closed if state.completion_toast.is_none() => state.closed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, CompletionToastData> for RuntimeState {
+    fn event(
+        state: &mut Self,
+        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _data: &CompletionToastData,
+        connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                proxy.ack_configure(serial);
+                if let Some(toast) = state.completion_toast.as_mut() {
+                    let width = if width == 0 { toast.size.width } else { width };
+                    let height = if height == 0 { toast.size.height } else { height };
+                    let (Ok(width_i32), Ok(height_i32)) = (i32::try_from(width), i32::try_from(height)) else {
+                        state.runtime_error =
+                            Some(CaptureError::InvalidFrame("feedback surface exceeds protocol range".into()));
+                        return;
+                    };
+                    toast.viewport.set_destination(width_i32, height_i32);
+                    toast.size =
+                        PixelSize { width: width.min(FEEDBACK_SIZE.width), height: height.min(FEEDBACK_SIZE.height) };
+                    toast.configured = true;
+                    state.feedback_dirty = true;
+                    redraw_feedback(state, connection);
+                }
             }
+            zwlr_layer_surface_v1::Event::Closed => state.closed = true,
             _ => {}
         }
     }
@@ -2618,6 +3361,295 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feedback_test_frame() -> CaptureFrame {
+        let size = PixelSize { width: 20, height: 20 };
+        CaptureFrame {
+            screen: lisnap_core::ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display".into(),
+                logical_geometry: None,
+                pixel_size: size,
+                scale_factor: Some(1.0),
+            },
+            image: RgbaImage::new(size, [10, 20, 30, 255].repeat(400)).unwrap(),
+            captured_at: std::time::SystemTime::now(),
+        }
+    }
+
+    fn feedback_test_state() -> RuntimeState {
+        RuntimeState {
+            editor_enabled: true,
+            editing: true,
+            logical_size: Some(PixelSize { width: 20, height: 20 }),
+            selection_pixels: Some(PixelRect { x: 0, y: 0, width: 20, height: 20 }),
+            annotations: vec![Annotation::Rectangle {
+                start: (2.0, 2.0),
+                end: (10.0, 10.0),
+                width: 3,
+                color: DEFAULT_COLOR,
+            }],
+            ..RuntimeState::default()
+        }
+    }
+
+    #[test]
+    fn saved_and_copied_images_are_output_once_before_success_confirmation_and_close() {
+        let frame = feedback_test_frame();
+        for copy in [false, true] {
+            let mut state = feedback_test_state();
+            let expected = compose_annotated_crop(
+                &frame,
+                state.logical_size.unwrap(),
+                state.selection_pixels.unwrap(),
+                &state.annotations,
+            )
+            .unwrap();
+            let calls = std::cell::Cell::new(0);
+            let mut output = |selection: PixelRect, image: &RgbaImage, actual_copy: bool| {
+                calls.set(calls.get() + 1);
+                assert_eq!(selection, PixelRect { x: 0, y: 0, width: 20, height: 20 });
+                assert_eq!(actual_copy, copy);
+                assert_eq!(image.pixels(), expected.pixels());
+                assert_ne!(image.pixels(), frame.image.pixels());
+                Ok("output.png".to_owned())
+            };
+            accept_editor(&mut state, copy);
+            let outcome = state.outcome.take().unwrap();
+            execute_editor_output(&mut state, &frame, outcome, &mut output);
+            let feedback = state.feedback.as_ref().unwrap();
+            assert!(!feedback.failed);
+            assert_eq!(feedback.copy, copy);
+            assert_eq!(feedback.detail, "output.png");
+            assert!(state.feedback_dirty);
+            assert!(state.pending_completion.is_some());
+            // The timer must not start until the feedback buffer is committed.
+            let now = Instant::now();
+            assert!(take_confirmed_output(&mut state, now + Duration::from_secs(10)).is_none());
+            accept_editor(&mut state, copy);
+            assert!(state.outcome.is_none());
+            assert_eq!(calls.get(), 1);
+            state.completion_deadline = Some(now + OUTPUT_CONFIRMATION_DURATION);
+            assert!(take_confirmed_output(&mut state, now + Duration::from_millis(1999)).is_none());
+            let Some(RuntimeOutcome::Completed { image, copy: completed_copy, .. }) =
+                take_confirmed_output(&mut state, now + OUTPUT_CONFIRMATION_DURATION)
+            else {
+                panic!("confirmation did not complete");
+            };
+            assert_eq!(image.pixels(), expected.pixels());
+            assert_eq!(completed_copy, copy);
+            assert!(state.completion_deadline.is_none());
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn output_failure_keeps_annotations_and_editor_open_and_allows_retry() {
+        let frame = feedback_test_frame();
+        for copy in [false, true] {
+            let mut state = feedback_test_state();
+            let annotations = state.annotations.clone();
+            accept_editor(&mut state, copy);
+            let outcome = state.outcome.take().unwrap();
+            execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| Err("output unavailable".into()));
+            assert!(state.feedback.as_ref().unwrap().failed);
+            assert_eq!(state.feedback.as_ref().unwrap().detail, "output unavailable");
+            assert!(state.pending_completion.is_none());
+            assert!(state.completion_deadline.is_none());
+            assert!(state.editing && !state.closed);
+            assert_eq!(state.annotations, annotations);
+            accept_editor(&mut state, copy);
+            let outcome = state.outcome.take().unwrap();
+            execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| Ok("retry succeeded".into()));
+            assert!(!state.feedback.as_ref().unwrap().failed);
+            assert_eq!(state.feedback.as_ref().unwrap().detail, "retry succeeded");
+            assert!(state.pending_completion.is_some());
+        }
+    }
+
+    #[test]
+    fn confirmation_only_releases_editor_interaction_without_discarding_result_or_timer() {
+        let frame = feedback_test_frame();
+        let mut state = feedback_test_state();
+        state.pointer_position = Some((10.0, 10.0));
+        state.pointer_enter_serial = Some(1);
+        state.drag_anchor = Some((5.0, 5.0));
+        state.text_input_enabled = true;
+        state.text_input_focus = true;
+        state.magnifier_visible = true;
+        state.mosaic_source = Some(MosaicSource { image: frame.image.clone(), logical_size: frame.image.size() });
+        accept_editor(&mut state, false);
+        let outcome = state.outcome.take().unwrap();
+        execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| Ok("capture.png".into()));
+        let now = Instant::now();
+        state.completion_deadline = Some(now + OUTPUT_CONFIRMATION_DURATION);
+        finish_editor_interaction(&mut state);
+        assert!(!state.editing && !state.text_input_enabled && !state.text_input_focus && !state.magnifier_visible);
+        assert!(
+            state.pointer_position.is_none() && state.pointer_enter_serial.is_none() && state.drag_anchor.is_none()
+        );
+        assert!(state.mosaic_source.is_none());
+        assert!(!state.feedback.as_ref().unwrap().failed);
+        assert!(state.pending_completion.is_some());
+        assert!(take_confirmed_output(&mut state, now + Duration::from_millis(1999)).is_none());
+        assert!(matches!(
+            take_confirmed_output(&mut state, now + OUTPUT_CONFIRMATION_DURATION),
+            Some(RuntimeOutcome::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn composition_failure_never_calls_output_or_reports_success() {
+        let frame = feedback_test_frame();
+        let mut state = feedback_test_state();
+        state.selection_pixels = Some(PixelRect { x: 100, y: 100, width: 20, height: 20 });
+        accept_editor(&mut state, false);
+        let outcome = state.outcome.take().unwrap();
+        execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| panic!("invalid crop reached output"));
+        assert!(state.feedback.as_ref().unwrap().failed);
+        assert!(state.pending_completion.is_none());
+    }
+
+    fn resize_test_state() -> RuntimeState {
+        RuntimeState {
+            editor_enabled: true,
+            editing: true,
+            logical_size: Some(PixelSize { width: 1000, height: 500 }),
+            frame_size: Some(PixelSize { width: 1500, height: 750 }),
+            selection_logical: Some(AnnotationRect { x: 100, y: 80, width: 400, height: 200 }),
+            selection_pixels: Some(PixelRect { x: 150, y: 120, width: 600, height: 300 }),
+            ..RuntimeState::default()
+        }
+    }
+
+    #[test]
+    fn magnifier_is_available_during_selection_and_resize_but_hides_over_editor_controls() {
+        let mut state =
+            RuntimeState { magnifier_enabled: true, pointer_position: Some((100.0, 100.0)), ..RuntimeState::default() };
+        assert!(should_show_magnifier(&state));
+        state.magnifier_enabled = false;
+        assert!(!should_show_magnifier(&state));
+        state.magnifier_enabled = true;
+        state.pointer_position = None;
+        assert!(!should_show_magnifier(&state));
+        let mut state = resize_test_state();
+        state.magnifier_enabled = true;
+        state.pointer_position = Some((500.0, 280.0));
+        assert!(begin_selection_resize(&mut state, (500.0, 280.0)));
+        assert!(should_show_magnifier(&state));
+        finish_selection_resize(&mut state);
+        let toolbar = toolbar_layout(state.selection_logical.unwrap(), state.logical_size.unwrap());
+        state.pointer_position = Some((f64::from(toolbar.bounds.x + 10), f64::from(toolbar.bounds.y + 10)));
+        assert!(!should_show_magnifier(&state));
+        state.pointer_position = Some((300.0, 180.0));
+        assert!(should_show_magnifier(&state));
+        state.context_menu = Some(color_menu_layout((300.0, 180.0), state.logical_size.unwrap()));
+        assert!(!should_show_magnifier(&state));
+        state.context_menu = None;
+        state.draft_annotation =
+            Some(DraftAnnotation::Pen { points: vec![(300.0, 180.0)], width: 3, color: DEFAULT_COLOR });
+        assert!(!should_show_magnifier(&state));
+        state.draft_annotation = None;
+        state.text_draft = Some(TextDraft::new((300.0, 180.0)));
+        assert!(!should_show_magnifier(&state));
+    }
+
+    #[test]
+    fn magnifier_shortcut_does_not_intercept_text_or_custom_color_input() {
+        let mut state = resize_test_state();
+        assert!(can_toggle_magnifier(&state));
+        state.text_draft = Some(TextDraft::new((300.0, 180.0)));
+        assert!(!can_toggle_magnifier(&state));
+        assert_eq!(key_to_ascii(M_KEY, false), Some('m'));
+        state.text_draft = None;
+        state.ctrl_pressed = true;
+        assert!(!can_toggle_magnifier(&state));
+        state.ctrl_pressed = false;
+        state.context_menu = Some(custom_color_menu_layout((300.0, 180.0), state.logical_size.unwrap()));
+        assert!(!can_toggle_magnifier(&state));
+    }
+
+    #[test]
+    fn selection_resize_updates_pixels_retains_annotations_and_supports_undo_redo() {
+        let mut state = resize_test_state();
+        let before = (state.selection_logical, state.selection_pixels);
+        let annotation =
+            Annotation::Arrow { start: (120.0, 100.0), end: (400.0, 200.0), width: 3, color: DEFAULT_COLOR };
+        add_annotation(&mut state, annotation.clone());
+        assert!(begin_selection_resize(&mut state, (500.0, 280.0)));
+        update_selection_resize(&mut state, (600.0, 330.0));
+        update_selection_resize(&mut state, (700.0, 380.0));
+        assert_eq!(state.selection_logical, Some(AnnotationRect { x: 100, y: 80, width: 600, height: 300 }));
+        assert_eq!(state.selection_pixels, Some(PixelRect { x: 150, y: 120, width: 900, height: 450 }));
+        assert!(state.static_dirty && state.draft_dirty && state.toolbar_dirty && state.selection_visuals_dirty);
+        assert_eq!(state.annotations, vec![annotation.clone()]);
+        assert_eq!(state.selected_annotation, None);
+        assert!(finish_selection_resize(&mut state));
+        assert_eq!(state.undo_operations.len(), 2);
+        let after = (state.selection_logical, state.selection_pixels);
+        undo_editor(&mut state);
+        assert_eq!((state.selection_logical, state.selection_pixels), before);
+        assert_eq!(state.annotations, vec![annotation.clone()]);
+        redo_editor(&mut state);
+        assert_eq!((state.selection_logical, state.selection_pixels), after);
+        undo_editor(&mut state);
+        undo_editor(&mut state);
+        assert!(state.annotations.is_empty());
+        redo_editor(&mut state);
+        redo_editor(&mut state);
+        assert_eq!((state.selection_logical, state.selection_pixels), after);
+        assert_eq!(state.annotations, vec![annotation]);
+    }
+
+    #[test]
+    fn cancelled_or_unmoved_resize_preserves_exact_original_pixel_bounds_and_history() {
+        let mut state = resize_test_state();
+        // A fractional initial drag may cover fewer pixels than its rounded logical outline.
+        state.selection_pixels = Some(PixelRect { x: 151, y: 121, width: 598, height: 298 });
+        let before = (state.selection_logical, state.selection_pixels);
+        assert!(!begin_selection_resize(&mut state, (300.0, 180.0)));
+        assert!(begin_selection_resize(&mut state, (100.0, 80.0)));
+        update_selection_resize(&mut state, (100.0, 80.0));
+        assert!(finish_selection_resize(&mut state));
+        assert_eq!((state.selection_logical, state.selection_pixels), before);
+        assert!(state.undo_operations.is_empty());
+        assert!(begin_selection_resize(&mut state, (100.0, 80.0)));
+        update_selection_resize(&mut state, (10.0, 10.0));
+        cancel_selection_resize(&mut state);
+        assert_eq!((state.selection_logical, state.selection_pixels), before);
+        assert!(state.resizing.is_none());
+        assert!(state.undo_operations.is_empty());
+    }
+
+    #[test]
+    fn resized_selection_is_used_by_save_and_copy() {
+        for copy in [false, true] {
+            let mut state = resize_test_state();
+            assert!(begin_selection_resize(&mut state, (500.0, 180.0)));
+            update_selection_resize(&mut state, (400.0, 180.0));
+            finish_selection_resize(&mut state);
+            accept_editor(&mut state, copy);
+            let Some(RuntimeOutcome::Accepted { selection, copy: actual_copy, .. }) = state.outcome else {
+                panic!("resized selection was not accepted");
+            };
+            assert_eq!(selection, PixelRect { x: 150, y: 120, width: 450, height: 300 });
+            assert_eq!(actual_copy, copy);
+        }
+    }
+
+    #[test]
+    fn beginning_resize_commits_pending_text_before_selection_history() {
+        let mut state = resize_test_state();
+        let mut text = TextDraft::new((200.0, 150.0));
+        text.insert_text("保留标注");
+        state.text_draft = Some(text);
+        assert!(begin_selection_resize(&mut state, (500.0, 180.0)));
+        assert!(state.text_draft.is_none());
+        assert!(matches!(state.annotations.as_slice(), [Annotation::Text { text, .. }] if text == "保留标注"));
+        update_selection_resize(&mut state, (600.0, 180.0));
+        finish_selection_resize(&mut state);
+        assert_eq!(state.undo_operations.len(), 2);
+    }
 
     #[test]
     fn rgba_is_converted_to_little_endian_xrgb() {
@@ -2634,6 +3666,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selection, PixelRect { x: 200, y: 100, width: 800, height: 400 });
+    }
+
+    #[test]
+    fn dimension_label_uses_export_pixels_at_fractional_and_axis_scales() {
+        let logical_size = PixelSize { width: 1000, height: 500 };
+        for (frame_size, expected) in [
+            (PixelSize { width: 1000, height: 500 }, "401 × 201 px"),
+            (PixelSize { width: 1250, height: 625 }, "501 × 252 px"),
+            (PixelSize { width: 2000, height: 1000 }, "801 × 401 px"),
+            (PixelSize { width: 2000, height: 1500 }, "801 × 602 px"),
+        ] {
+            let start = (100.25, 50.25);
+            let end = (500.5, 250.5);
+            let dimensions = selection_dimensions(start, end, logical_size, frame_size).unwrap();
+            assert_eq!(dimensions.text, expected);
+            assert_eq!(selection_dimensions(end, start, logical_size, frame_size), Some(dimensions));
+        }
+    }
+
+    #[test]
+    fn dimension_label_clips_to_output_and_hides_for_empty_selection() {
+        let logical_size = PixelSize { width: 1000, height: 500 };
+        let frame_size = PixelSize { width: 2000, height: 1000 };
+        let dimensions = selection_dimensions((-100.0, -50.0), (1100.0, 550.0), logical_size, frame_size).unwrap();
+        assert_eq!(dimensions.text, "2000 × 1000 px");
+        for (start, end) in [
+            ((100.0, 50.0), (100.0, 50.0)),
+            ((100.25, 50.25), (100.25, 50.25)),
+            ((100.0, 50.0), (100.0, 250.0)),
+            ((1100.0, 550.0), (1200.0, 600.0)),
+        ] {
+            assert_eq!(selection_dimensions(start, end, logical_size, frame_size), None);
+        }
     }
 
     #[test]
