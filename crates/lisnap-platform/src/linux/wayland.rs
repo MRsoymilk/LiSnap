@@ -438,8 +438,8 @@ pub fn run_editor_socket(path: &Path, frame: &CaptureFrame) -> Result<WaylandEdi
     map_editor_outcome(overlay_runtime::run_editor_connection(connect_socket(path)?, frame, None)?)
 }
 
-/// Save/copy through `output`, show the actual result, and close after a short
-/// success confirmation. Failed output operations leave the editor open to retry.
+/// Save/copy through `output`, immediately release the capture UI on success,
+/// and show a short non-interactive confirmation. Failures keep the editor open.
 /// An Accepted outcome means `output` already completed; do not execute it again.
 pub fn run_editor_with_output(
     frame: &CaptureFrame,

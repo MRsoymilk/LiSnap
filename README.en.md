@@ -43,7 +43,7 @@ LiSnap is a work-in-progress desktop screenshot editor with a straightforward wo
 - **Inline annotation:** Pen, rectangle, arrow, text, and mosaic, with selection/movement of existing annotations, draggable arrow endpoints, double-click text editing, and undo/redo.
 - **Flexible drawing styles:** 12 preset colors, custom HSV selection, RGB/HEX input, plus configurable line width, font size, and mosaic block size.
 - **Save or copy:** Save/Confirm writes an annotated PNG; Copy sends PNG data to the Wayland clipboard using `wl-copy` without creating an extra file.
-- **Output feedback:** Successful Save/Copy shows an in-editor confirmation (including the saved path) for about 2 seconds before closing. Failures show an error and keep the editor open so you can retry.
+- **Output feedback:** Successful Save/Copy immediately dismisses the capture UI and releases mouse/keyboard focus, leaving only an independent confirmation (including the saved path) for about 2 seconds. The toast does not intercept input, so other windows remain usable immediately. Failures show an error and keep the editor open so you can retry.
 - **Cursor and text input:** Captured images exclude the pointer by default while the live pointer stays usable. Unicode text entry and Wayland `text-input-v3` integration are implemented, subject to compositor and IME support.
 
 > **Alpha software:** Automated checks cover capture protocols, pixel processing, and editor logic. Multi-monitor scenarios, clipboard interoperability, and IME behavior still require verification in an actual Hyprland desktop session.

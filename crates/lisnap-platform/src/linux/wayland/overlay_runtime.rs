@@ -181,6 +181,89 @@ struct EditorSurfaces {
     menu_layer: EditorLayer,
 }
 
+#[derive(Debug)]
+struct CompletionToast {
+    surface: wl_surface::WlSurface,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    viewport: wp_viewport::WpViewport,
+    buffer: wl_buffer::WlBuffer,
+    size: PixelSize,
+    configured: bool,
+    _file: File,
+}
+
+#[derive(Debug)]
+struct CompletionToastData;
+
+impl CompletionToast {
+    fn new(
+        factory: &EditorLayerFactory<'_>,
+        layer_shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        output: &wl_output::WlOutput,
+        viewporter: &wp_viewporter::WpViewporter,
+        screen: PixelSize,
+    ) -> Result<Self, CaptureError> {
+        let bounds = feedback_layout(screen);
+        let surface = factory.compositor.create_surface(factory.queue_handle, ());
+        let input = factory.compositor.create_region(factory.queue_handle, ());
+        surface.set_input_region(Some(&input));
+        input.destroy();
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            Some(output),
+            zwlr_layer_shell_v1::Layer::Overlay,
+            "lisnap-feedback".into(),
+            factory.queue_handle,
+            CompletionToastData,
+        );
+        layer_surface.set_size(bounds.width as u32, bounds.height as u32);
+        layer_surface.set_anchor(zwlr_layer_surface_v1::Anchor::Top);
+        layer_surface.set_margin(bounds.y, 0, 0, 0);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+
+        // Only the small toast is mapped, with a transparent one-pixel parent.
+        // No full-screen screenshot buffer or input grab survives the transition.
+        let name = CString::new("lisnap-feedback-parent")
+            .map_err(|_| CaptureError::BackendFailure("invalid feedback memfd name".into()))?;
+        let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+            .map_err(|error| CaptureError::BackendFailure(format!("feedback memfd_create failed: {error}")))?;
+        let mut file = File::from(fd);
+        file.set_len(4)
+            .map_err(|error| CaptureError::BackendFailure(format!("resizing feedback SHM failed: {error}")))?;
+        file.write_all(&[0; 4])
+            .map_err(|error| CaptureError::BackendFailure(format!("writing feedback SHM failed: {error}")))?;
+        let pool = factory.shm.create_pool(file.as_fd(), 4, factory.queue_handle, ());
+        let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, factory.queue_handle, ());
+        pool.destroy();
+        let viewport = viewporter.get_viewport(&surface, factory.queue_handle, ());
+        viewport.set_destination(bounds.width, bounds.height);
+        surface.commit();
+        Ok(Self {
+            surface,
+            layer_surface,
+            viewport,
+            buffer,
+            size: PixelSize { width: bounds.width as u32, height: bounds.height as u32 },
+            configured: false,
+            _file: file,
+        })
+    }
+
+    fn commit(&self) {
+        self.surface.attach(Some(&self.buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, 1, 1);
+        self.surface.commit();
+    }
+
+    fn destroy(self) {
+        self.viewport.destroy();
+        self.buffer.destroy();
+        self.layer_surface.destroy();
+        self.surface.destroy();
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CanvasBufferData {
     layer: EditorLayerKind,
@@ -277,6 +360,10 @@ struct RuntimeState {
     feedback_layer: Option<EditorLayer>,
     feedback: Option<EditorFeedback>,
     feedback_dirty: bool,
+    editor_surface: Option<wl_surface::WlSurface>,
+    editor_layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    editor_output: Option<wl_output::WlOutput>,
+    completion_toast: Option<CompletionToast>,
     pending_completion: Option<RuntimeOutcome>,
     completion_deadline: Option<Instant>,
     draft_annotation: Option<DraftAnnotation>,
@@ -887,6 +974,9 @@ fn run_connection_mode(
     );
     layer_surface.set_exclusive_zone(-1);
     layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
+    state.editor_surface = Some(surface.clone());
+    state.editor_layer_surface = Some(layer_surface.clone());
+    state.editor_output = Some(output.clone());
     surface.commit();
 
     let (serial, logical_width, logical_height) =
@@ -1012,6 +1102,9 @@ fn run_connection_mode(
     if let Some(feedback) = state.feedback_layer.take() {
         feedback.destroy();
     }
+    if let Some(toast) = state.completion_toast.take() {
+        toast.destroy();
+    }
     if let Some(magnifier) = state.magnifier_layer.take() {
         magnifier.destroy();
     }
@@ -1058,6 +1151,9 @@ fn run_input_loop(
                 && let Some(output) = output.as_mut()
             {
                 execute_editor_output(state, frame, outcome, *output);
+                if state.pending_completion.is_some() {
+                    release_editor_for_confirmation(state, &event_queue.handle(), connection)?;
+                }
                 redraw_editor(state, connection);
                 continue;
             }
@@ -1133,6 +1229,90 @@ fn take_confirmed_output(state: &mut RuntimeState, now: Instant) -> Option<Runti
     }
     state.completion_deadline = None;
     state.pending_completion.take()
+}
+
+fn release_editor_for_confirmation(
+    state: &mut RuntimeState,
+    queue_handle: &QueueHandle<RuntimeState>,
+    connection: &Connection,
+) -> Result<(), CaptureError> {
+    if state.pending_completion.is_none() || state.completion_toast.is_some() {
+        return Ok(());
+    }
+    let (
+        Some(compositor),
+        Some(subcompositor),
+        Some(shm),
+        Some(layer_shell),
+        Some(viewporter),
+        Some(output),
+        Some(screen),
+        Some(parent),
+    ) = (
+        state.compositor.as_ref(),
+        state.subcompositor.as_ref(),
+        state.shm.as_ref(),
+        state.layer_shell.as_ref(),
+        state.viewporter.as_ref(),
+        state.editor_output.as_ref(),
+        state.logical_size,
+        state.editor_surface.as_ref(),
+    )
+    else {
+        return Err(CaptureError::BackendFailure("missing Wayland objects for output confirmation".into()));
+    };
+    let factory = EditorLayerFactory { compositor, subcompositor, shm, parent, size: FEEDBACK_SIZE, queue_handle };
+    let toast = CompletionToast::new(&factory, layer_shell, output, viewporter, screen)?;
+    let toast_factory = EditorLayerFactory { parent: &toast.surface, ..factory };
+    let feedback_layer = EditorLayer::new(EditorLayerKind::Feedback, &toast_factory, None)?;
+
+    // Unmap the frozen capture and release exclusive focus in the same commit.
+    // The new toast has no pointer input region and never requests keyboard focus.
+    if let Some(layer_surface) = state.editor_layer_surface.as_ref() {
+        layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    }
+    parent.attach(None, 0, 0);
+    parent.commit();
+    if let Some(text_input) = state.text_input.take() {
+        if state.text_input_enabled {
+            text_input.disable();
+            text_input.commit();
+        }
+        text_input.destroy();
+    }
+    if let Some(layer) = state.feedback_layer.replace(feedback_layer) {
+        layer.destroy();
+    }
+    if let Some(surfaces) = state.editor_surfaces.take() {
+        surfaces.destroy();
+    }
+    if let Some(layer) = state.magnifier_layer.take() {
+        layer.destroy();
+    }
+    if let Some(visuals) = state.visuals.take() {
+        visuals.destroy();
+    }
+    state.completion_toast = Some(toast);
+    finish_editor_interaction(state);
+    connection
+        .flush()
+        .map_err(|error| CaptureError::BackendFailure(format!("releasing screenshot editor failed: {error}")))
+}
+
+fn finish_editor_interaction(state: &mut RuntimeState) {
+    state.editing = false;
+    state.text_input_enabled = false;
+    state.text_input_focus = false;
+    state.pointer_position = None;
+    state.pointer_enter_serial = None;
+    state.drag_anchor = None;
+    state.resizing = None;
+    state.moving = None;
+    state.mosaic_source = None;
+    state.draft_annotation = None;
+    state.context_menu = None;
+    state.magnifier_visible = false;
+    stop_text_cursor_blink(state);
 }
 
 fn reset_text_cursor_blink(state: &mut RuntimeState) {
@@ -1397,6 +1577,9 @@ fn redraw_feedback(state: &mut RuntimeState, connection: &Connection) {
     if !state.feedback_dirty {
         return;
     }
+    if state.completion_toast.as_ref().is_some_and(|toast| !toast.configured) {
+        return;
+    }
     let (Some(feedback), Some(screen), Some(layer)) =
         (state.feedback.as_ref(), state.logical_size, state.feedback_layer.as_mut())
     else {
@@ -1405,14 +1588,20 @@ fn redraw_feedback(state: &mut RuntimeState, connection: &Connection) {
     if !layer.has_available_buffer() {
         return;
     }
-    let bounds = feedback_layout(screen);
+    let bounds = if let Some(toast) = state.completion_toast.as_ref() {
+        AnnotationRect { x: 0, y: 0, width: toast.size.width as i32, height: toast.size.height as i32 }
+    } else {
+        feedback_layout(screen)
+    };
     let region = AnnotationRect { x: 0, y: 0, ..bounds };
     let pixels = render_feedback_patch(bounds, feedback);
     match layer.redraw_patch(region, &pixels) {
         Ok(true) => {
             layer.subsurface.set_position(bounds.x, bounds.y);
             state.feedback_dirty = false;
-            if let Some(visuals) = state.visuals.as_ref() {
+            if let Some(toast) = state.completion_toast.as_ref() {
+                toast.commit();
+            } else if let Some(visuals) = state.visuals.as_ref() {
                 visuals.parent.commit();
             }
             if let Err(error) = connection.flush() {
@@ -2989,7 +3178,11 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         if matches!(event, wl_buffer::Event::Release) {
             if data.layer == EditorLayerKind::Feedback {
                 if let Some(layer) = state.feedback_layer.as_mut() {
-                    layer.mark_released(data.slot);
+                    // A retired editor feedback buffer can release after the
+                    // independent toast has replaced it. Never recycle its slot.
+                    if layer.buffers.get(data.slot).is_some_and(|buffer| buffer.buffer == *_proxy) {
+                        layer.mark_released(data.slot);
+                    }
                 }
                 redraw_feedback(state, connection);
                 return;
@@ -3125,9 +3318,41 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for RuntimeState {
             zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
                 state.configure = Some((serial, width, height));
             }
-            zwlr_layer_surface_v1::Event::Closed => {
-                state.closed = true;
+            zwlr_layer_surface_v1::Event::Closed if state.completion_toast.is_none() => state.closed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, CompletionToastData> for RuntimeState {
+    fn event(
+        state: &mut Self,
+        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _data: &CompletionToastData,
+        connection: &Connection,
+        _queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                proxy.ack_configure(serial);
+                if let Some(toast) = state.completion_toast.as_mut() {
+                    let width = if width == 0 { toast.size.width } else { width };
+                    let height = if height == 0 { toast.size.height } else { height };
+                    let (Ok(width_i32), Ok(height_i32)) = (i32::try_from(width), i32::try_from(height)) else {
+                        state.runtime_error =
+                            Some(CaptureError::InvalidFrame("feedback surface exceeds protocol range".into()));
+                        return;
+                    };
+                    toast.viewport.set_destination(width_i32, height_i32);
+                    toast.size =
+                        PixelSize { width: width.min(FEEDBACK_SIZE.width), height: height.min(FEEDBACK_SIZE.height) };
+                    toast.configured = true;
+                    state.feedback_dirty = true;
+                    redraw_feedback(state, connection);
+                }
             }
+            zwlr_layer_surface_v1::Event::Closed => state.closed = true,
             _ => {}
         }
     }
@@ -3240,6 +3465,37 @@ mod tests {
             assert_eq!(state.feedback.as_ref().unwrap().detail, "retry succeeded");
             assert!(state.pending_completion.is_some());
         }
+    }
+
+    #[test]
+    fn confirmation_only_releases_editor_interaction_without_discarding_result_or_timer() {
+        let frame = feedback_test_frame();
+        let mut state = feedback_test_state();
+        state.pointer_position = Some((10.0, 10.0));
+        state.pointer_enter_serial = Some(1);
+        state.drag_anchor = Some((5.0, 5.0));
+        state.text_input_enabled = true;
+        state.text_input_focus = true;
+        state.magnifier_visible = true;
+        state.mosaic_source = Some(MosaicSource { image: frame.image.clone(), logical_size: frame.image.size() });
+        accept_editor(&mut state, false);
+        let outcome = state.outcome.take().unwrap();
+        execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| Ok("capture.png".into()));
+        let now = Instant::now();
+        state.completion_deadline = Some(now + OUTPUT_CONFIRMATION_DURATION);
+        finish_editor_interaction(&mut state);
+        assert!(!state.editing && !state.text_input_enabled && !state.text_input_focus && !state.magnifier_visible);
+        assert!(
+            state.pointer_position.is_none() && state.pointer_enter_serial.is_none() && state.drag_anchor.is_none()
+        );
+        assert!(state.mosaic_source.is_none());
+        assert!(!state.feedback.as_ref().unwrap().failed);
+        assert!(state.pending_completion.is_some());
+        assert!(take_confirmed_output(&mut state, now + Duration::from_millis(1999)).is_none());
+        assert!(matches!(
+            take_confirmed_output(&mut state, now + OUTPUT_CONFIRMATION_DURATION),
+            Some(RuntimeOutcome::Completed { .. })
+        ));
     }
 
     #[test]
