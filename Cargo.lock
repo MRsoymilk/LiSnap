@@ -1193,7 +1193,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lisnap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "lisnap-core",
  "lisnap-platform",
@@ -1203,11 +1203,11 @@ dependencies = [
 
 [[package]]
 name = "lisnap-core"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "lisnap-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fontdue",
  "lisnap-core",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "lisnap-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "lisnap-core",

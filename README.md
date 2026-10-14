@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-2563eb" />
+  <img alt="Version 0.1.1" src="https://img.shields.io/badge/version-0.1.1-2563eb" />
   <img alt="Rust 1.97+" src="https://img.shields.io/badge/Rust-1.97%2B-f97316" />
   <img alt="Linux Wayland" src="https://img.shields.io/badge/Linux-Wayland-0891b2" />
   <img alt="Development status: Alpha" src="https://img.shields.io/badge/status-alpha-64748b" />
