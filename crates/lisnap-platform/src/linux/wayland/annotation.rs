@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 
+use super::feedback::EditorFeedback;
 use super::magnifier::{MagnifierPreview, PIXEL_GRID, PIXEL_RADIUS, PIXEL_ZOOM};
 use fontdue::{Font, FontSettings};
 use lisnap_core::{CaptureError, CaptureFrame, PixelRect, PixelSize, RgbaImage};
@@ -761,6 +762,25 @@ pub(crate) fn render_selection_dimensions_patch(dimensions: &SelectionDimensions
     let mut raster = patch_raster(bounds);
     raster.fill_rect_replace(bounds, TOOLBAR_BG);
     raster.draw_text_bitmap((10, 8), &dimensions.text, 2, TOOLBAR_ICON);
+    finish_patch(raster)
+}
+
+pub(crate) fn render_feedback_patch(bounds: RectI, feedback: &EditorFeedback) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, [24, 27, 32, 255]);
+    let accent = if feedback.failed { [255, 105, 105, 255] } else { [88, 220, 145, 255] };
+    raster.fill_rect_replace(RectI { x: 0, y: 0, width: 5, height: bounds.height }, accent);
+    if system_font().is_some() {
+        draw_text(&mut raster, (20.0, 12.0), feedback.title(true), 20, accent, 1.0, 1.0);
+    } else {
+        raster.draw_text_bitmap((20, 14), feedback.title(false), 2, accent);
+    }
+    let max_chars = ((bounds.width - 40).max(0) / 14) as usize;
+    let detail: Vec<_> = feedback.display_detail(max_chars * 2).chars().collect();
+    let detail =
+        detail.chunks(max_chars.max(1)).map(|line| line.iter().collect::<String>()).collect::<Vec<_>>().join("\n");
+    draw_text(&mut raster, (20.0, 44.0), &detail, 14, TOOLBAR_ICON, 1.0, 1.0);
     finish_patch(raster)
 }
 
@@ -2085,6 +2105,18 @@ mod tests {
     use super::*;
     use lisnap_core::ScreenInfo;
     use std::time::SystemTime;
+
+    #[test]
+    fn output_feedback_renders_success_and_failure_and_clips_to_small_outputs() {
+        for failed in [false, true] {
+            let feedback = EditorFeedback { copy: false, failed, detail: "/tmp/截图.png".into() };
+            let full = render_feedback_patch(RectI { x: 200, y: 24, width: 520, height: 88 }, &feedback);
+            assert_eq!(full.len(), 520 * 88 * 4);
+            assert_eq!(&full[..4], if failed { &[105, 105, 255, 255] } else { &[145, 220, 88, 255] });
+            assert!(full.chunks_exact(4).all(|pixel| pixel[3] == 255));
+            assert_eq!(render_feedback_patch(RectI { x: 0, y: 0, width: 10, height: 10 }, &feedback).len(), 400);
+        }
+    }
 
     #[test]
     fn magnifier_renders_nearest_neighbor_pixels_center_marker_and_color_swatch() {

@@ -9,6 +9,7 @@ use std::{
 
 use lisnap_core::{CaptureError, CaptureFrame, LogicalRect, PixelRect, PixelSize, RgbaImage, selection_to_pixels};
 
+use super::WaylandEditorOutputHandler;
 use super::annotation::{
     Annotation, ArrowHandle, CONTEXT_MENU_SIZE, CUSTOM_DRAG_HUE, CUSTOM_DRAG_SV, CUSTOM_HUE_ID, CUSTOM_SV_ID,
     ContextMenu, ContextMenuKind, CustomColorEditor, DEFAULT_COLOR, DraftAnnotation, EditorTool, MosaicSource, PALETTE,
@@ -16,10 +17,11 @@ use super::annotation::{
     annotation_damage_regions, annotation_hit_test, arrow_handle_hit_test, color_menu_layout, compose_annotated_crop,
     context_menu_layout, custom_color_menu_layout, custom_hue_at, custom_sat_value_at, custom_slider_value,
     draft_damage_regions, key_to_ascii, normalized_rect, preload_system_font, render_annotations_patch_with_source,
-    render_context_menu_patch, render_draft_patch_with_move, render_magnifier_patch, render_selection_dimensions_patch,
-    render_toolbar_patch_with_color, selected_annotation_damage, selected_annotation_hit_test,
-    selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
+    render_context_menu_patch, render_draft_patch_with_move, render_feedback_patch, render_magnifier_patch,
+    render_selection_dimensions_patch, render_toolbar_patch_with_color, selected_annotation_damage,
+    selected_annotation_hit_test, selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
 };
+use super::feedback::{EditorFeedback, FEEDBACK_SIZE, feedback_layout};
 use super::magnifier::{MAGNIFIER_SIZE, magnifier_preview};
 use super::selection::{ResizeHandle, resize_handle_rects, resize_hit_test, resized_selection};
 use rustix::{
@@ -65,6 +67,7 @@ const M_KEY: u32 = 50;
 const DELETE_KEY: u32 = 111;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TEXT_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const OUTPUT_CONFIRMATION_DURATION: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrozenOverlayOutcome {
@@ -84,6 +87,7 @@ pub(crate) enum EditorOverlayOutcome {
 enum RuntimeOutcome {
     Selected(PixelRect),
     Accepted { selection: PixelRect, logical_size: PixelSize, annotations: Vec<Annotation>, copy: bool },
+    Completed { selection: PixelRect, image: RgbaImage, copy: bool },
     Cancelled,
     Closed,
 }
@@ -126,6 +130,7 @@ struct OverlayVisuals {
 enum EditorLayerKind {
     Dimensions,
     Magnifier,
+    Feedback,
     Static,
     Draft,
     Toolbar,
@@ -269,6 +274,11 @@ struct RuntimeState {
     magnifier_enabled: bool,
     magnifier_visible: bool,
     magnifier_dirty: bool,
+    feedback_layer: Option<EditorLayer>,
+    feedback: Option<EditorFeedback>,
+    feedback_dirty: bool,
+    pending_completion: Option<RuntimeOutcome>,
+    completion_deadline: Option<Instant>,
     draft_annotation: Option<DraftAnnotation>,
     text_draft: Option<TextDraft>,
     stroke_width: i32,
@@ -668,7 +678,7 @@ impl EditorSurfaces {
 
     fn mark_released(&mut self, layer: EditorLayerKind, slot: usize) {
         match layer {
-            EditorLayerKind::Dimensions | EditorLayerKind::Magnifier => {}
+            EditorLayerKind::Dimensions | EditorLayerKind::Magnifier | EditorLayerKind::Feedback => {}
             EditorLayerKind::Static => self.static_layer.mark_released(slot),
             EditorLayerKind::Draft => self.draft_layer.mark_released(slot),
             EditorLayerKind::Toolbar => self.toolbar_layer.mark_released(slot),
@@ -769,11 +779,11 @@ pub(crate) fn run_connection(
     connection: Connection,
     frame: &CaptureFrame,
 ) -> Result<FrozenOverlayOutcome, CaptureError> {
-    match run_connection_mode(connection, frame, false)? {
+    match run_connection_mode(connection, frame, false, None)? {
         RuntimeOutcome::Selected(selection) => Ok(FrozenOverlayOutcome::Selected(selection)),
         RuntimeOutcome::Cancelled => Ok(FrozenOverlayOutcome::Cancelled),
         RuntimeOutcome::Closed => Ok(FrozenOverlayOutcome::Closed),
-        RuntimeOutcome::Accepted { .. } => {
+        RuntimeOutcome::Accepted { .. } | RuntimeOutcome::Completed { .. } => {
             Err(CaptureError::BackendFailure("selection overlay unexpectedly returned an editor result".into()))
         }
     }
@@ -782,13 +792,17 @@ pub(crate) fn run_connection(
 pub(crate) fn run_editor_connection(
     connection: Connection,
     frame: &CaptureFrame,
+    output: Option<&mut WaylandEditorOutputHandler<'_>>,
 ) -> Result<EditorOverlayOutcome, CaptureError> {
-    match run_connection_mode(connection, frame, true)? {
+    match run_connection_mode(connection, frame, true, output)? {
         RuntimeOutcome::Accepted { selection, logical_size, annotations, copy } => Ok(EditorOverlayOutcome::Accepted {
             selection,
             image: compose_annotated_crop(frame, logical_size, selection, &annotations)?,
             copy,
         }),
+        RuntimeOutcome::Completed { selection, image, copy } => {
+            Ok(EditorOverlayOutcome::Accepted { selection, image, copy })
+        }
         RuntimeOutcome::Cancelled => Ok(EditorOverlayOutcome::Cancelled),
         RuntimeOutcome::Closed => Ok(EditorOverlayOutcome::Closed),
         RuntimeOutcome::Selected(_) => {
@@ -801,6 +815,7 @@ fn run_connection_mode(
     connection: Connection,
     frame: &CaptureFrame,
     editor_enabled: bool,
+    output_handler: Option<&mut WaylandEditorOutputHandler<'_>>,
 ) -> Result<RuntimeOutcome, CaptureError> {
     if editor_enabled {
         preload_system_font();
@@ -973,6 +988,11 @@ fn run_connection_mode(
         .map(|surfaces| &surfaces.menu_layer.surface)
         .or_else(|| state.visuals.as_ref().map(OverlayVisuals::top_surface));
     state.magnifier_layer = Some(EditorLayer::new(EditorLayerKind::Magnifier, &magnifier_factory, stack_above)?);
+    if editor_enabled {
+        let factory = EditorLayerFactory { size: FEEDBACK_SIZE, ..magnifier_factory };
+        let stack_above = state.magnifier_layer.as_ref().map(|layer| &layer.surface);
+        state.feedback_layer = Some(EditorLayer::new(EditorLayerKind::Feedback, &factory, stack_above)?);
+    }
     surface.commit();
     state.magnifier_dirty = true;
     redraw_magnifier(&mut state, &connection);
@@ -980,7 +1000,7 @@ fn run_connection_mode(
         .flush()
         .map_err(|error| CaptureError::BackendFailure(format!("mapping Wayland overlay failed: {error}")))?;
 
-    let outcome = run_input_loop(&mut event_queue, &mut state, &connection);
+    let outcome = run_input_loop(&mut event_queue, &mut state, &connection, frame, output_handler);
 
     if let Some(text_input) = state.text_input.take() {
         if state.text_input_enabled {
@@ -988,6 +1008,9 @@ fn run_connection_mode(
             text_input.commit();
         }
         text_input.destroy();
+    }
+    if let Some(feedback) = state.feedback_layer.take() {
+        feedback.destroy();
     }
     if let Some(magnifier) = state.magnifier_layer.take() {
         magnifier.destroy();
@@ -1023,28 +1046,46 @@ fn run_input_loop(
     event_queue: &mut wayland_client::EventQueue<RuntimeState>,
     state: &mut RuntimeState,
     connection: &Connection,
+    frame: &CaptureFrame,
+    mut output: Option<&mut WaylandEditorOutputHandler<'_>>,
 ) -> Result<RuntimeOutcome, CaptureError> {
     loop {
         if let Some(error) = state.runtime_error.take() {
             return Err(error);
         }
         if let Some(outcome) = state.outcome.take() {
+            if matches!(outcome, RuntimeOutcome::Accepted { .. })
+                && let Some(output) = output.as_mut()
+            {
+                execute_editor_output(state, frame, outcome, *output);
+                redraw_editor(state, connection);
+                continue;
+            }
+            return Ok(outcome);
+        }
+        if let Some(outcome) = take_confirmed_output(state, Instant::now()) {
             return Ok(outcome);
         }
         if state.closed {
-            return Ok(RuntimeOutcome::Closed);
+            return Ok(state.pending_completion.take().unwrap_or(RuntimeOutcome::Closed));
         }
 
-        if let Some(deadline) = state.text_cursor_blink_at {
+        let deadline = match (state.text_cursor_blink_at, state.completion_deadline) {
+            (Some(blink), Some(completion)) => Some(blink.min(completion)),
+            (blink, completion) => blink.or(completion),
+        };
+        if let Some(deadline) = deadline {
             match dispatch_with_deadline(event_queue, state, deadline, "Wayland overlay input dispatch") {
                 Ok(()) => {}
                 Err(CaptureError::Timeout) => {
-                    if state.text_draft.is_some() {
+                    if state.text_cursor_blink_at.is_some_and(|blink| Instant::now() >= blink)
+                        && state.text_draft.is_some()
+                    {
                         state.text_cursor_visible = !state.text_cursor_visible;
                         state.text_cursor_blink_at = Some(Instant::now() + TEXT_CURSOR_BLINK_INTERVAL);
                         state.draft_dirty = true;
                         redraw_editor(state, connection);
-                    } else {
+                    } else if state.text_draft.is_none() {
                         state.text_cursor_visible = false;
                         state.text_cursor_blink_at = None;
                     }
@@ -1057,6 +1098,41 @@ fn run_input_loop(
             })?;
         }
     }
+}
+
+fn execute_editor_output(
+    state: &mut RuntimeState,
+    frame: &CaptureFrame,
+    outcome: RuntimeOutcome,
+    output: &mut WaylandEditorOutputHandler<'_>,
+) {
+    let RuntimeOutcome::Accepted { selection, logical_size, annotations, copy } = outcome else {
+        return;
+    };
+    let result = compose_annotated_crop(frame, logical_size, selection, &annotations)
+        .map_err(|error| error.to_string())
+        .and_then(|image| output(selection, &image, copy).map(|detail| (image, detail)));
+    state.completion_deadline = None;
+    stop_text_cursor_blink(state);
+    state.feedback_dirty = true;
+    match result {
+        Ok((image, detail)) => {
+            state.feedback = Some(EditorFeedback { copy, failed: false, detail });
+            state.pending_completion = Some(RuntimeOutcome::Completed { selection, image, copy });
+        }
+        Err(detail) => {
+            state.feedback = Some(EditorFeedback { copy, failed: true, detail });
+            state.pending_completion = None;
+        }
+    }
+}
+
+fn take_confirmed_output(state: &mut RuntimeState, now: Instant) -> Option<RuntimeOutcome> {
+    if state.completion_deadline.is_none_or(|deadline| now < deadline) {
+        return None;
+    }
+    state.completion_deadline = None;
+    state.pending_completion.take()
 }
 
 fn reset_text_cursor_blink(state: &mut RuntimeState) {
@@ -1242,7 +1318,7 @@ fn apply_text_input_done(state: &mut RuntimeState, serial: u32, connection: &Con
 }
 
 fn should_show_magnifier(state: &RuntimeState) -> bool {
-    if !state.magnifier_enabled || state.pointer_position.is_none() {
+    if !state.magnifier_enabled || state.pointer_position.is_none() || state.feedback.is_some() {
         return false;
     }
     if !state.editing {
@@ -1317,7 +1393,42 @@ fn can_toggle_magnifier(state: &RuntimeState) -> bool {
         && !state.context_menu.as_ref().is_some_and(|menu| menu.kind == ContextMenuKind::CustomColor)
 }
 
+fn redraw_feedback(state: &mut RuntimeState, connection: &Connection) {
+    if !state.feedback_dirty {
+        return;
+    }
+    let (Some(feedback), Some(screen), Some(layer)) =
+        (state.feedback.as_ref(), state.logical_size, state.feedback_layer.as_mut())
+    else {
+        return;
+    };
+    if !layer.has_available_buffer() {
+        return;
+    }
+    let bounds = feedback_layout(screen);
+    let region = AnnotationRect { x: 0, y: 0, ..bounds };
+    let pixels = render_feedback_patch(bounds, feedback);
+    match layer.redraw_patch(region, &pixels) {
+        Ok(true) => {
+            layer.subsurface.set_position(bounds.x, bounds.y);
+            state.feedback_dirty = false;
+            if let Some(visuals) = state.visuals.as_ref() {
+                visuals.parent.commit();
+            }
+            if let Err(error) = connection.flush() {
+                state.runtime_error =
+                    Some(CaptureError::BackendFailure(format!("flushing output feedback failed: {error}")));
+            } else if state.pending_completion.is_some() && state.completion_deadline.is_none() {
+                state.completion_deadline = Some(Instant::now() + OUTPUT_CONFIRMATION_DURATION);
+            }
+        }
+        Ok(false) => {}
+        Err(error) => state.runtime_error = Some(error),
+    }
+}
+
 fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
+    redraw_feedback(state, connection);
     redraw_magnifier(state, connection);
     if !state.editor_enabled || !state.editing {
         return;
@@ -1608,6 +1719,9 @@ fn redo_editor(state: &mut RuntimeState) {
 }
 
 fn accept_editor(state: &mut RuntimeState, copy: bool) {
+    if state.outcome.is_some() || state.pending_completion.is_some() {
+        return;
+    }
     commit_text_draft(state);
     if let (Some(selection), Some(logical_size)) = (state.selection_pixels, state.logical_size) {
         state.outcome =
@@ -2698,6 +2812,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+        if state.pending_completion.is_some() {
+            return;
+        }
         if let wl_pointer::Event::Enter { serial, .. } = &event {
             state.pointer_enter_serial = Some(*serial);
         }
@@ -2804,6 +2921,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
+        if state.pending_completion.is_some() {
+            return;
+        }
         if let wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } = event {
             if key == M_KEY && key_state == wl_keyboard::KeyState::Pressed && can_toggle_magnifier(state) {
                 state.magnifier_enabled = !state.magnifier_enabled;
@@ -2867,6 +2987,13 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
+            if data.layer == EditorLayerKind::Feedback {
+                if let Some(layer) = state.feedback_layer.as_mut() {
+                    layer.mark_released(data.slot);
+                }
+                redraw_feedback(state, connection);
+                return;
+            }
             if data.layer == EditorLayerKind::Magnifier {
                 if let Some(layer) = state.magnifier_layer.as_mut() {
                     layer.mark_released(data.slot);
@@ -3009,6 +3136,123 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feedback_test_frame() -> CaptureFrame {
+        let size = PixelSize { width: 20, height: 20 };
+        CaptureFrame {
+            screen: lisnap_core::ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display".into(),
+                logical_geometry: None,
+                pixel_size: size,
+                scale_factor: Some(1.0),
+            },
+            image: RgbaImage::new(size, [10, 20, 30, 255].repeat(400)).unwrap(),
+            captured_at: std::time::SystemTime::now(),
+        }
+    }
+
+    fn feedback_test_state() -> RuntimeState {
+        RuntimeState {
+            editor_enabled: true,
+            editing: true,
+            logical_size: Some(PixelSize { width: 20, height: 20 }),
+            selection_pixels: Some(PixelRect { x: 0, y: 0, width: 20, height: 20 }),
+            annotations: vec![Annotation::Rectangle {
+                start: (2.0, 2.0),
+                end: (10.0, 10.0),
+                width: 3,
+                color: DEFAULT_COLOR,
+            }],
+            ..RuntimeState::default()
+        }
+    }
+
+    #[test]
+    fn saved_and_copied_images_are_output_once_before_success_confirmation_and_close() {
+        let frame = feedback_test_frame();
+        for copy in [false, true] {
+            let mut state = feedback_test_state();
+            let expected = compose_annotated_crop(
+                &frame,
+                state.logical_size.unwrap(),
+                state.selection_pixels.unwrap(),
+                &state.annotations,
+            )
+            .unwrap();
+            let calls = std::cell::Cell::new(0);
+            let mut output = |selection: PixelRect, image: &RgbaImage, actual_copy: bool| {
+                calls.set(calls.get() + 1);
+                assert_eq!(selection, PixelRect { x: 0, y: 0, width: 20, height: 20 });
+                assert_eq!(actual_copy, copy);
+                assert_eq!(image.pixels(), expected.pixels());
+                assert_ne!(image.pixels(), frame.image.pixels());
+                Ok("output.png".to_owned())
+            };
+            accept_editor(&mut state, copy);
+            let outcome = state.outcome.take().unwrap();
+            execute_editor_output(&mut state, &frame, outcome, &mut output);
+            let feedback = state.feedback.as_ref().unwrap();
+            assert!(!feedback.failed);
+            assert_eq!(feedback.copy, copy);
+            assert_eq!(feedback.detail, "output.png");
+            assert!(state.feedback_dirty);
+            assert!(state.pending_completion.is_some());
+            // The timer must not start until the feedback buffer is committed.
+            let now = Instant::now();
+            assert!(take_confirmed_output(&mut state, now + Duration::from_secs(10)).is_none());
+            accept_editor(&mut state, copy);
+            assert!(state.outcome.is_none());
+            assert_eq!(calls.get(), 1);
+            state.completion_deadline = Some(now + OUTPUT_CONFIRMATION_DURATION);
+            assert!(take_confirmed_output(&mut state, now + Duration::from_millis(1999)).is_none());
+            let Some(RuntimeOutcome::Completed { image, copy: completed_copy, .. }) =
+                take_confirmed_output(&mut state, now + OUTPUT_CONFIRMATION_DURATION)
+            else {
+                panic!("confirmation did not complete");
+            };
+            assert_eq!(image.pixels(), expected.pixels());
+            assert_eq!(completed_copy, copy);
+            assert!(state.completion_deadline.is_none());
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn output_failure_keeps_annotations_and_editor_open_and_allows_retry() {
+        let frame = feedback_test_frame();
+        for copy in [false, true] {
+            let mut state = feedback_test_state();
+            let annotations = state.annotations.clone();
+            accept_editor(&mut state, copy);
+            let outcome = state.outcome.take().unwrap();
+            execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| Err("output unavailable".into()));
+            assert!(state.feedback.as_ref().unwrap().failed);
+            assert_eq!(state.feedback.as_ref().unwrap().detail, "output unavailable");
+            assert!(state.pending_completion.is_none());
+            assert!(state.completion_deadline.is_none());
+            assert!(state.editing && !state.closed);
+            assert_eq!(state.annotations, annotations);
+            accept_editor(&mut state, copy);
+            let outcome = state.outcome.take().unwrap();
+            execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| Ok("retry succeeded".into()));
+            assert!(!state.feedback.as_ref().unwrap().failed);
+            assert_eq!(state.feedback.as_ref().unwrap().detail, "retry succeeded");
+            assert!(state.pending_completion.is_some());
+        }
+    }
+
+    #[test]
+    fn composition_failure_never_calls_output_or_reports_success() {
+        let frame = feedback_test_frame();
+        let mut state = feedback_test_state();
+        state.selection_pixels = Some(PixelRect { x: 100, y: 100, width: 20, height: 20 });
+        accept_editor(&mut state, false);
+        let outcome = state.outcome.take().unwrap();
+        execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| panic!("invalid crop reached output"));
+        assert!(state.feedback.as_ref().unwrap().failed);
+        assert!(state.pending_completion.is_none());
+    }
 
     fn resize_test_state() -> RuntimeState {
         RuntimeState {
