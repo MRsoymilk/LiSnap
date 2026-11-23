@@ -41,6 +41,7 @@ LiSnap is a work-in-progress desktop screenshot editor with a straightforward wo
 - **Live pixel dimensions:** Displays width × height (px) at the selection's top-left using actual capture pixels, including on scaled displays. The label is not included in saved or copied images.
 - **Pixel magnifier and color inspection:** A 12× magnifier follows the pointer, highlights the center pixel, and shows its HEX / RGB color and pixel coordinates. Samples come from the original frozen capture, not the mask or annotations. Press `M` to show/hide it; it hides automatically during drawing, text entry, and tool menus, and is excluded from exported images.
 - **Inline annotation:** Pen, rectangle, arrow, text, and mosaic, with selection/movement of existing annotations, draggable arrow endpoints, double-click text editing, and undo/redo.
+- **Pin to desktop:** The pin toolbar button keeps the selected image and its annotations above other windows. Drag the image or its header within the captured monitor; click the top-right close button or right-click to dismiss. Only the pin receives pointer input, without taking keyboard focus from other applications. Pinning does not save a file or change the clipboard.
 - **Flexible drawing styles:** 12 preset colors, custom HSV selection, RGB/HEX input, plus configurable line width, font size, and mosaic block size.
 - **Save or copy:** Save/Confirm writes an annotated PNG; Copy sends PNG data to the Wayland clipboard using `wl-copy` without creating an extra file.
 - **Output feedback:** Successful Save/Copy immediately dismisses the capture UI and releases mouse/keyboard focus, leaving only an independent confirmation (including the saved path) for about 2 seconds. The toast does not intercept input, so other windows remain usable immediately. Failures show an error and keep the editor open so you can retry.
@@ -118,6 +119,7 @@ For the complete CLI reference, run `cargo run -p lisnap -- --help`.
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Y` |
 | Save PNG | Use Save or Confirm (`Enter`); `--output` sets the file destination |
 | Copy image | Use the Copy icon; requires `wl-copy` |
+| Pin to desktop | Use the Pin icon; drag the image/header to move, click `×` or right-click to close |
 | Cancel | Click Cancel or press `Esc` (which may first cancel an active edit or selection) |
 
 During text entry, `Ctrl+A` selects all text, with text-level undo/redo. Chinese and other Unicode input use system fonts and the compositor's `text-input-v3` support. Mosaic directly pixelates the exported image; **it is not encryption**.

@@ -18,11 +18,13 @@ use super::annotation::{
     context_menu_layout, custom_color_menu_layout, custom_hue_at, custom_sat_value_at, custom_slider_value,
     draft_damage_regions, key_to_ascii, normalized_rect, preload_system_font, render_annotations_patch_with_source,
     render_context_menu_patch, render_draft_patch_with_move, render_feedback_patch, render_magnifier_patch,
-    render_selection_dimensions_patch, render_toolbar_patch_with_color, selected_annotation_damage,
-    selected_annotation_hit_test, selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
+    render_pin_header_patch, render_selection_dimensions_patch, render_toolbar_patch_with_color,
+    rgba_to_wayland_argb_in_place, selected_annotation_damage, selected_annotation_hit_test,
+    selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
 };
 use super::feedback::{EditorFeedback, FEEDBACK_SIZE, feedback_layout};
 use super::magnifier::{MAGNIFIER_SIZE, magnifier_preview};
+use super::pin::{PinInteraction, PinLayout, pin_layout};
 use super::selection::{ResizeHandle, resize_handle_rects, resize_hit_test, resized_selection};
 use rustix::{
     event::{PollFd, PollFlags, poll},
@@ -79,6 +81,7 @@ pub(crate) enum FrozenOverlayOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum EditorOverlayOutcome {
     Accepted { selection: PixelRect, image: RgbaImage, copy: bool },
+    Pinned,
     Cancelled,
     Closed,
 }
@@ -86,8 +89,24 @@ pub(crate) enum EditorOverlayOutcome {
 #[derive(Debug, Clone)]
 enum RuntimeOutcome {
     Selected(PixelRect),
-    Accepted { selection: PixelRect, logical_size: PixelSize, annotations: Vec<Annotation>, copy: bool },
-    Completed { selection: PixelRect, image: RgbaImage, copy: bool },
+    Accepted {
+        selection: PixelRect,
+        logical_size: PixelSize,
+        annotations: Vec<Annotation>,
+        copy: bool,
+    },
+    Completed {
+        selection: PixelRect,
+        image: RgbaImage,
+        copy: bool,
+    },
+    PinRequested {
+        selection: PixelRect,
+        logical_size: PixelSize,
+        display: AnnotationRect,
+        annotations: Vec<Annotation>,
+    },
+    Pinned,
     Cancelled,
     Closed,
 }
@@ -135,6 +154,7 @@ enum EditorLayerKind {
     Draft,
     Toolbar,
     Menu,
+    PinnedHeader,
 }
 
 #[derive(Debug)]
@@ -179,6 +199,111 @@ struct EditorSurfaces {
     draft_layer: EditorLayer,
     toolbar_layer: EditorLayer,
     menu_layer: EditorLayer,
+}
+
+#[derive(Debug)]
+struct PinnedImage {
+    image: OverlayQuad,
+    header: EditorLayer,
+    image_buffer: wl_buffer::WlBuffer,
+    backdrop_buffer: wl_buffer::WlBuffer,
+    interaction: PinInteraction,
+    _file: File,
+}
+
+impl PinnedImage {
+    fn new(
+        factory: &EditorLayerFactory<'_>,
+        viewporter: &wp_viewporter::WpViewporter,
+        image: &RgbaImage,
+        layout: PinLayout,
+        screen: PixelSize,
+    ) -> Result<Self, CaptureError> {
+        let size = image.size();
+        let width =
+            i32::try_from(size.width).map_err(|_| CaptureError::InvalidFrame("pin image is too wide".into()))?;
+        let height =
+            i32::try_from(size.height).map_err(|_| CaptureError::InvalidFrame("pin image is too tall".into()))?;
+        let stride =
+            width.checked_mul(4).ok_or_else(|| CaptureError::InvalidFrame("pin image stride overflow".into()))?;
+        let byte_len = image
+            .pixels()
+            .len()
+            .checked_add(4)
+            .and_then(|len| i32::try_from(len).ok())
+            .ok_or_else(|| CaptureError::InvalidFrame("pin image SHM exceeds protocol range".into()))?;
+        let name = CString::new("lisnap-pinned-image")
+            .map_err(|_| CaptureError::BackendFailure("invalid pin memfd name".into()))?;
+        let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
+            .map_err(|error| CaptureError::BackendFailure(format!("pin memfd_create failed: {error}")))?;
+        let mut file = File::from(fd);
+        file.set_len(byte_len as u64)
+            .map_err(|error| CaptureError::BackendFailure(format!("resizing pin SHM failed: {error}")))?;
+        let mut pixels = image.pixels().to_vec();
+        rgba_to_wayland_argb_in_place(&mut pixels);
+        file.write_all(&[0; 4])
+            .and_then(|_| file.write_all(&pixels))
+            .map_err(|error| CaptureError::BackendFailure(format!("writing pin SHM failed: {error}")))?;
+        let pool = factory.shm.create_pool(file.as_fd(), byte_len, factory.queue_handle, ());
+        let backdrop_buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, factory.queue_handle, ());
+        let image_buffer =
+            pool.create_buffer(4, width, height, stride, wl_shm::Format::Argb8888, factory.queue_handle, ());
+        pool.destroy();
+        let image_surface = OverlayVisuals::create_quad(
+            factory.compositor,
+            factory.subcompositor,
+            viewporter,
+            factory.parent,
+            factory.queue_handle,
+        );
+        image_surface.viewport.set_destination(layout.image.width, layout.image.height);
+        image_surface.surface.attach(Some(&image_buffer), 0, 0);
+        image_surface.surface.damage_buffer(0, 0, width, height);
+        image_surface.surface.commit();
+        let header_factory = EditorLayerFactory {
+            size: PixelSize { width: layout.bounds.width as u32, height: layout.header_height as u32 },
+            ..*factory
+        };
+        let mut header =
+            EditorLayer::new(EditorLayerKind::PinnedHeader, &header_factory, Some(&image_surface.surface))?;
+        let bounds = AnnotationRect { x: 0, y: 0, width: layout.bounds.width, height: layout.header_height };
+        header.redraw_patch(bounds, &render_pin_header_patch(bounds))?;
+        Ok(Self {
+            image: image_surface,
+            header,
+            image_buffer,
+            backdrop_buffer,
+            interaction: PinInteraction::new(layout, screen),
+            _file: file,
+        })
+    }
+
+    fn present(
+        &self,
+        compositor: &wl_compositor::WlCompositor,
+        parent: &wl_surface::WlSurface,
+        queue_handle: &QueueHandle<RuntimeState>,
+    ) {
+        let layout = self.interaction.layout;
+        self.image.subsurface.set_position(layout.image.x, layout.image.y);
+        self.header.subsurface.set_position(layout.bounds.x, layout.bounds.y);
+        // All pointer events use this stationary parent. Only the visible card
+        // receives input; the rest of the desktop stays fully interactive.
+        let region = compositor.create_region(queue_handle, ());
+        region.add(layout.bounds.x, layout.bounds.y, layout.bounds.width, layout.bounds.height);
+        parent.set_input_region(Some(&region));
+        region.destroy();
+        parent.commit();
+    }
+
+    fn destroy(self) {
+        self.header.destroy();
+        self.image.viewport.destroy();
+        self.image.subsurface.destroy();
+        self.image.surface.destroy();
+        self.image_buffer.destroy();
+        self.backdrop_buffer.destroy();
+    }
 }
 
 #[derive(Debug)]
@@ -364,6 +489,8 @@ struct RuntimeState {
     editor_layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     editor_output: Option<wl_output::WlOutput>,
     completion_toast: Option<CompletionToast>,
+    pinned_image: Option<PinnedImage>,
+    editor_viewport: Option<wp_viewport::WpViewport>,
     pending_completion: Option<RuntimeOutcome>,
     completion_deadline: Option<Instant>,
     draft_annotation: Option<DraftAnnotation>,
@@ -765,7 +892,10 @@ impl EditorSurfaces {
 
     fn mark_released(&mut self, layer: EditorLayerKind, slot: usize) {
         match layer {
-            EditorLayerKind::Dimensions | EditorLayerKind::Magnifier | EditorLayerKind::Feedback => {}
+            EditorLayerKind::Dimensions
+            | EditorLayerKind::Magnifier
+            | EditorLayerKind::Feedback
+            | EditorLayerKind::PinnedHeader => {}
             EditorLayerKind::Static => self.static_layer.mark_released(slot),
             EditorLayerKind::Draft => self.draft_layer.mark_released(slot),
             EditorLayerKind::Toolbar => self.toolbar_layer.mark_released(slot),
@@ -870,7 +1000,10 @@ pub(crate) fn run_connection(
         RuntimeOutcome::Selected(selection) => Ok(FrozenOverlayOutcome::Selected(selection)),
         RuntimeOutcome::Cancelled => Ok(FrozenOverlayOutcome::Cancelled),
         RuntimeOutcome::Closed => Ok(FrozenOverlayOutcome::Closed),
-        RuntimeOutcome::Accepted { .. } | RuntimeOutcome::Completed { .. } => {
+        RuntimeOutcome::Accepted { .. }
+        | RuntimeOutcome::Completed { .. }
+        | RuntimeOutcome::PinRequested { .. }
+        | RuntimeOutcome::Pinned => {
             Err(CaptureError::BackendFailure("selection overlay unexpectedly returned an editor result".into()))
         }
     }
@@ -891,8 +1024,9 @@ pub(crate) fn run_editor_connection(
             Ok(EditorOverlayOutcome::Accepted { selection, image, copy })
         }
         RuntimeOutcome::Cancelled => Ok(EditorOverlayOutcome::Cancelled),
+        RuntimeOutcome::Pinned => Ok(EditorOverlayOutcome::Pinned),
         RuntimeOutcome::Closed => Ok(EditorOverlayOutcome::Closed),
-        RuntimeOutcome::Selected(_) => {
+        RuntimeOutcome::Selected(_) | RuntimeOutcome::PinRequested { .. } => {
             Err(CaptureError::BackendFailure("editor overlay unexpectedly returned a selection-only result".into()))
         }
     }
@@ -1021,23 +1155,20 @@ fn run_connection_mode(
         .map_err(|error| CaptureError::BackendFailure(format!("resizing overlay SHM buffer failed: {error}")))?;
     file.write_all(&native)
         .map_err(|error| CaptureError::BackendFailure(format!("writing overlay SHM buffer failed: {error}")))?;
+    drop(native);
 
     let pool = shm.create_pool(file.as_fd(), size_i32, &queue_handle, ());
     let buffer = pool.create_buffer(0, width_i32, height_i32, stride_i32, wl_shm::Format::Xrgb8888, &queue_handle, ());
     pool.destroy();
 
-    let viewport = if frame_size.width != logical_width || frame_size.height != logical_height {
-        let viewport = viewporter.get_viewport(&surface, &queue_handle, ());
-        viewport.set_destination(
-            i32::try_from(logical_width)
-                .map_err(|_| CaptureError::InvalidFrame("overlay destination width exceeds protocol range".into()))?,
-            i32::try_from(logical_height)
-                .map_err(|_| CaptureError::InvalidFrame("overlay destination height exceeds protocol range".into()))?,
-        );
-        Some(viewport)
-    } else {
-        None
-    };
+    let viewport = viewporter.get_viewport(&surface, &queue_handle, ());
+    viewport.set_destination(
+        i32::try_from(logical_width)
+            .map_err(|_| CaptureError::InvalidFrame("overlay destination width exceeds protocol range".into()))?,
+        i32::try_from(logical_height)
+            .map_err(|_| CaptureError::InvalidFrame("overlay destination height exceeds protocol range".into()))?,
+    );
+    state.editor_viewport = Some(viewport.clone());
 
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, width_i32, height_i32);
@@ -1105,6 +1236,9 @@ fn run_connection_mode(
     if let Some(toast) = state.completion_toast.take() {
         toast.destroy();
     }
+    if let Some(pin) = state.pinned_image.take() {
+        pin.destroy();
+    }
     if let Some(magnifier) = state.magnifier_layer.take() {
         magnifier.destroy();
     }
@@ -1117,9 +1251,7 @@ fn run_connection_mode(
     surface.attach(None, 0, 0);
     surface.commit();
     let _ = event_queue.roundtrip(&mut state);
-    if let Some(viewport) = viewport {
-        viewport.destroy();
-    }
+    viewport.destroy();
     buffer.destroy();
     layer_surface.destroy();
     surface.destroy();
@@ -1147,6 +1279,10 @@ fn run_input_loop(
             return Err(error);
         }
         if let Some(outcome) = state.outcome.take() {
+            if matches!(outcome, RuntimeOutcome::PinRequested { .. }) {
+                show_pinned_capture(state, frame, outcome, &event_queue.handle(), connection)?;
+                continue;
+            }
             if matches!(outcome, RuntimeOutcome::Accepted { .. })
                 && let Some(output) = output.as_mut()
             {
@@ -1231,6 +1367,57 @@ fn take_confirmed_output(state: &mut RuntimeState, now: Instant) -> Option<Runti
     state.pending_completion.take()
 }
 
+fn show_pinned_capture(
+    state: &mut RuntimeState,
+    frame: &CaptureFrame,
+    outcome: RuntimeOutcome,
+    queue_handle: &QueueHandle<RuntimeState>,
+    connection: &Connection,
+) -> Result<(), CaptureError> {
+    let RuntimeOutcome::PinRequested { selection, logical_size, display, annotations } = outcome else {
+        return Ok(());
+    };
+    let image = compose_annotated_crop(frame, logical_size, selection, &annotations)?;
+    let layout = pin_layout(display, logical_size).ok_or(CaptureError::InvalidSelection)?;
+    let (Some(compositor), Some(subcompositor), Some(shm), Some(viewporter), Some(parent), Some(viewport)) = (
+        state.compositor.clone(),
+        state.subcompositor.clone(),
+        state.shm.clone(),
+        state.viewporter.clone(),
+        state.editor_surface.clone(),
+        state.editor_viewport.clone(),
+    ) else {
+        return Err(CaptureError::BackendFailure("missing Wayland objects for pinned image".into()));
+    };
+    let factory = EditorLayerFactory {
+        compositor: &compositor,
+        subcompositor: &subcompositor,
+        shm: &shm,
+        parent: &parent,
+        size: logical_size,
+        queue_handle,
+    };
+    let pin = PinnedImage::new(&factory, &viewporter, &image, layout, logical_size)?;
+    if let Some(layer_surface) = state.editor_layer_surface.as_ref() {
+        layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    }
+    if let Some(feedback) = state.feedback_layer.take() {
+        feedback.destroy();
+    }
+    retire_editor_surfaces(state);
+    finish_editor_interaction(state);
+    state.feedback = None;
+    state.feedback_dirty = false;
+    // Keep a stable parent coordinate system for smooth dragging, but replace
+    // the frozen screen with a transparent pixel. Only the pin itself is opaque.
+    viewport.set_destination(logical_size.width as i32, logical_size.height as i32);
+    parent.attach(Some(&pin.backdrop_buffer), 0, 0);
+    parent.damage(0, 0, logical_size.width as i32, logical_size.height as i32);
+    pin.present(&compositor, &parent, queue_handle);
+    state.pinned_image = Some(pin);
+    connection.flush().map_err(|error| CaptureError::BackendFailure(format!("showing pinned image failed: {error}")))
+}
+
 fn release_editor_for_confirmation(
     state: &mut RuntimeState,
     queue_handle: &QueueHandle<RuntimeState>,
@@ -1273,15 +1460,24 @@ fn release_editor_for_confirmation(
     }
     parent.attach(None, 0, 0);
     parent.commit();
+    if let Some(layer) = state.feedback_layer.replace(feedback_layer) {
+        layer.destroy();
+    }
+    retire_editor_surfaces(state);
+    state.completion_toast = Some(toast);
+    finish_editor_interaction(state);
+    connection
+        .flush()
+        .map_err(|error| CaptureError::BackendFailure(format!("releasing screenshot editor failed: {error}")))
+}
+
+fn retire_editor_surfaces(state: &mut RuntimeState) {
     if let Some(text_input) = state.text_input.take() {
         if state.text_input_enabled {
             text_input.disable();
             text_input.commit();
         }
         text_input.destroy();
-    }
-    if let Some(layer) = state.feedback_layer.replace(feedback_layer) {
-        layer.destroy();
     }
     if let Some(surfaces) = state.editor_surfaces.take() {
         surfaces.destroy();
@@ -1292,11 +1488,6 @@ fn release_editor_for_confirmation(
     if let Some(visuals) = state.visuals.take() {
         visuals.destroy();
     }
-    state.completion_toast = Some(toast);
-    finish_editor_interaction(state);
-    connection
-        .flush()
-        .map_err(|error| CaptureError::BackendFailure(format!("releasing screenshot editor failed: {error}")))
 }
 
 fn finish_editor_interaction(state: &mut RuntimeState) {
@@ -1918,6 +2109,23 @@ fn accept_editor(state: &mut RuntimeState, copy: bool) {
     }
 }
 
+fn pin_editor(state: &mut RuntimeState) {
+    if state.outcome.is_some() || state.pending_completion.is_some() {
+        return;
+    }
+    commit_text_draft(state);
+    if let (Some(selection), Some(logical_size), Some(display)) =
+        (state.selection_pixels, state.logical_size, state.selection_logical)
+    {
+        state.outcome = Some(RuntimeOutcome::PinRequested {
+            selection,
+            logical_size,
+            display,
+            annotations: state.annotations.clone(),
+        });
+    }
+}
+
 fn handle_toolbar_action(state: &mut RuntimeState, action: ToolbarAction) {
     match action {
         ToolbarAction::Color => {}
@@ -1936,6 +2144,7 @@ fn handle_toolbar_action(state: &mut RuntimeState, action: ToolbarAction) {
         ToolbarAction::Redo => redo_editor(state),
         ToolbarAction::Confirm | ToolbarAction::Save => accept_editor(state, false),
         ToolbarAction::Copy => accept_editor(state, true),
+        ToolbarAction::Pin => pin_editor(state),
         ToolbarAction::Cancel => state.outcome = Some(RuntimeOutcome::Cancelled),
     }
 }
@@ -2992,6 +3201,64 @@ impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for RuntimeS
     }
 }
 
+fn handle_pinned_pointer(
+    state: &mut RuntimeState,
+    event: wl_pointer::Event,
+    connection: &Connection,
+    queue_handle: &QueueHandle<RuntimeState>,
+) {
+    let Some(pin) = state.pinned_image.as_mut() else { return };
+    let mut moved = false;
+    match event {
+        wl_pointer::Event::Enter { serial, surface_x, surface_y, .. } => {
+            state.pointer_enter_serial = Some(serial);
+            moved = pin.interaction.motion((surface_x, surface_y));
+        }
+        wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+            moved = pin.interaction.motion((surface_x, surface_y));
+        }
+        wl_pointer::Event::Leave { .. } => {
+            state.pointer_enter_serial = None;
+            pin.interaction.leave();
+        }
+        wl_pointer::Event::Button {
+            button: BTN_LEFT, state: WEnum::Value(wl_pointer::ButtonState::Pressed), ..
+        } => {
+            if pin.interaction.press() {
+                state.outcome = Some(RuntimeOutcome::Pinned);
+            }
+        }
+        wl_pointer::Event::Button {
+            button: BTN_LEFT, state: WEnum::Value(wl_pointer::ButtonState::Released), ..
+        } => {
+            pin.interaction.release();
+        }
+        wl_pointer::Event::Button {
+            button: BTN_RIGHT, state: WEnum::Value(wl_pointer::ButtonState::Pressed), ..
+        } if pin.interaction.contains_pointer() => {
+            state.outcome = Some(RuntimeOutcome::Pinned);
+        }
+        _ => {}
+    }
+    if moved && let (Some(compositor), Some(parent)) = (state.compositor.as_ref(), state.editor_surface.as_ref()) {
+        pin.present(compositor, parent, queue_handle);
+    }
+    if let (Some(device), Some(serial)) = (state.cursor_shape_device.as_ref(), state.pointer_enter_serial) {
+        use wp_cursor_shape_device_v1::Shape;
+        let shape = if pin.interaction.is_dragging() {
+            Shape::Grabbing
+        } else if pin.interaction.over_close_button() {
+            Shape::Pointer
+        } else {
+            Shape::Grab
+        };
+        device.set_shape(serial, shape);
+    }
+    if let Err(error) = connection.flush() {
+        state.runtime_error = Some(CaptureError::BackendFailure(format!("moving pinned image failed: {error}")));
+    }
+}
+
 impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
     fn event(
         state: &mut Self,
@@ -2999,8 +3266,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for RuntimeState {
         event: wl_pointer::Event,
         _data: &(),
         connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
+        queue_handle: &QueueHandle<Self>,
     ) {
+        if state.pinned_image.is_some() {
+            handle_pinned_pointer(state, event, connection, queue_handle);
+            return;
+        }
         if state.pending_completion.is_some() {
             return;
         }
@@ -3110,7 +3381,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for RuntimeState {
         connection: &Connection,
         _queue_handle: &QueueHandle<Self>,
     ) {
-        if state.pending_completion.is_some() {
+        if state.pending_completion.is_some() || state.pinned_image.is_some() {
             return;
         }
         if let wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } = event {
@@ -3176,6 +3447,12 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
+            if data.layer == EditorLayerKind::PinnedHeader {
+                if let Some(pin) = state.pinned_image.as_mut() {
+                    pin.header.mark_released(data.slot);
+                }
+                return;
+            }
             if data.layer == EditorLayerKind::Feedback {
                 if let Some(layer) = state.feedback_layer.as_mut() {
                     // A retired editor feedback buffer can release after the
@@ -3391,6 +3668,45 @@ mod tests {
             }],
             ..RuntimeState::default()
         }
+    }
+
+    #[test]
+    fn pin_button_snapshots_selection_and_annotations_without_saving_or_copying() {
+        let frame = feedback_test_frame();
+        let mut state = feedback_test_state();
+        state.selection_logical = Some(AnnotationRect { x: 0, y: 0, width: 20, height: 20 });
+        let mut text = TextDraft::new((4.0, 5.0));
+        text.insert_text("钉图");
+        state.text_draft = Some(text);
+        handle_toolbar_action(&mut state, ToolbarAction::Pin);
+        assert!(state.text_draft.is_none());
+        assert!(state.pending_completion.is_none() && state.completion_deadline.is_none() && state.feedback.is_none());
+        let outcome = state.outcome.take().unwrap();
+        let RuntimeOutcome::PinRequested { selection, logical_size, display, annotations } = outcome.clone() else {
+            panic!("pin button did not request a pinned image");
+        };
+        assert_eq!(selection, state.selection_pixels.unwrap());
+        assert_eq!(display, state.selection_logical.unwrap());
+        assert_eq!(annotations.len(), 2);
+        assert!(matches!(&annotations[1], Annotation::Text { text, .. } if text == "钉图"));
+        let composed = compose_annotated_crop(&frame, logical_size, selection, &annotations).unwrap();
+        assert_eq!(composed.size(), PixelSize { width: 20, height: 20 });
+        assert_ne!(composed.pixels(), frame.image.pixels());
+        execute_editor_output(&mut state, &frame, outcome, &mut |_, _, _| panic!("pin must not save/copy"));
+        assert!(state.pending_completion.is_none() && state.feedback.is_none());
+    }
+
+    #[test]
+    fn pin_ignores_duplicate_request_and_requires_a_valid_selection() {
+        let mut state = RuntimeState::default();
+        pin_editor(&mut state);
+        assert!(state.outcome.is_none());
+        let mut state = feedback_test_state();
+        state.selection_logical = Some(AnnotationRect { x: 0, y: 0, width: 20, height: 20 });
+        pin_editor(&mut state);
+        accept_editor(&mut state, true);
+        pin_editor(&mut state);
+        assert!(matches!(state.outcome, Some(RuntimeOutcome::PinRequested { .. })));
     }
 
     #[test]

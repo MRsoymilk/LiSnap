@@ -5,6 +5,7 @@ mod feedback;
 mod magnifier;
 mod overlay;
 mod overlay_runtime;
+mod pin;
 mod selection;
 mod shm;
 mod wlr;
@@ -93,7 +94,13 @@ pub enum WaylandOverlayOutcome {
 
 #[derive(Debug, Clone)]
 pub enum WaylandEditorOutcome {
-    Accepted { selection: PixelRect, image: lisnap_core::RgbaImage, copy: bool },
+    Accepted {
+        selection: PixelRect,
+        image: lisnap_core::RgbaImage,
+        copy: bool,
+    },
+    /// The selection was pinned and its floating window has now been closed.
+    Pinned,
     Cancelled,
     Closed,
 }
@@ -464,6 +471,7 @@ fn map_editor_outcome(outcome: overlay_runtime::EditorOverlayOutcome) -> Result<
             WaylandEditorOutcome::Accepted { selection, image, copy }
         }
         overlay_runtime::EditorOverlayOutcome::Cancelled => WaylandEditorOutcome::Cancelled,
+        overlay_runtime::EditorOverlayOutcome::Pinned => WaylandEditorOutcome::Pinned,
         overlay_runtime::EditorOverlayOutcome::Closed => WaylandEditorOutcome::Closed,
     })
 }

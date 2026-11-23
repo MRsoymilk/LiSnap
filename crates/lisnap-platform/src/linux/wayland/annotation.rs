@@ -32,6 +32,7 @@ pub(crate) enum ToolbarAction {
     Redo,
     Save,
     Copy,
+    Pin,
     Confirm,
     Cancel,
 }
@@ -590,7 +591,7 @@ const TOOLBAR_BUTTON: i32 = 40;
 const TOOLBAR_GAP: i32 = 6;
 const TOOLBAR_PAD: i32 = 8;
 const TOOLBAR_HEIGHT: i32 = TOOLBAR_BUTTON + TOOLBAR_PAD * 2;
-const TOOLBAR_COUNT: i32 = 12;
+const TOOLBAR_COUNT: i32 = 13;
 
 const TEXT_SELECTION_COLOR: [u8; 4] = [77, 139, 233, 185];
 const TOOLBAR_BG: [u8; 4] = [24, 27, 32, 232];
@@ -613,6 +614,7 @@ const MOSAIC_ICON: &str = include_str!("../../../../../res/icons/toolbar/mosaic.
 const UNDO_ICON: &str = include_str!("../../../../../res/icons/toolbar/undo.svg");
 const REDO_ICON: &str = include_str!("../../../../../res/icons/toolbar/redo.svg");
 const SAVE_ICON: &str = include_str!("../../../../../res/icons/toolbar/save.svg");
+const PIN_ICON: &str = include_str!("../../../../../res/icons/toolbar/pin.svg");
 const COPY_ICON: &str = include_str!("../../../../../res/icons/toolbar/copy.svg");
 const CONFIRM_ICON: &str = include_str!("../../../../../res/icons/toolbar/confirm.svg");
 const CANCEL_ICON: &str = include_str!("../../../../../res/icons/toolbar/cancel.svg");
@@ -654,6 +656,7 @@ pub(crate) fn toolbar_layout(selection: RectI, screen: PixelSize) -> ToolbarLayo
         ToolbarAction::Redo,
         ToolbarAction::Save,
         ToolbarAction::Copy,
+        ToolbarAction::Pin,
         ToolbarAction::Confirm,
         ToolbarAction::Cancel,
     ];
@@ -747,6 +750,19 @@ pub(crate) fn render_draft_patch_with_move(
     if let Some(annotation) = movable {
         draw_selected_annotation(&mut raster, annotation);
     }
+    finish_patch(raster)
+}
+
+pub(crate) fn render_pin_header_patch(bounds: RectI) -> Vec<u8> {
+    let bounds = RectI { x: 0, y: 0, ..bounds };
+    let mut raster = patch_raster(bounds);
+    raster.fill_rect_replace(bounds, [24, 27, 32, 255]);
+    if bounds.width >= 80 {
+        draw_svg_icon(&mut raster, RectI { x: 4, y: 0, width: 28, height: 28 }, PIN_ICON, TOOLBAR_ICON);
+        raster.draw_text_bitmap((36, 10), "PIN", 1, TOOLBAR_ICON);
+    }
+    let x = bounds.width - bounds.width.min(28);
+    draw_svg_icon(&mut raster, RectI { x, y: 0, width: 28, height: 28 }, CANCEL_ICON, TOOLBAR_CANCEL);
     finish_patch(raster)
 }
 
@@ -1475,6 +1491,7 @@ fn toolbar_icon(action: ToolbarAction) -> (&'static str, [u8; 4]) {
         ToolbarAction::Redo => (REDO_ICON, TOOLBAR_ICON),
         ToolbarAction::Save => (SAVE_ICON, TOOLBAR_ICON),
         ToolbarAction::Copy => (COPY_ICON, TOOLBAR_ICON),
+        ToolbarAction::Pin => (PIN_ICON, TOOLBAR_ICON),
         ToolbarAction::Confirm => (CONFIRM_ICON, TOOLBAR_CONFIRM),
         ToolbarAction::Cancel => (CANCEL_ICON, TOOLBAR_CANCEL),
     }
@@ -2028,7 +2045,7 @@ impl Raster {
     }
 }
 
-fn rgba_to_wayland_argb_in_place(rgba: &mut [u8]) {
+pub(crate) fn rgba_to_wayland_argb_in_place(rgba: &mut [u8]) {
     for pixel in rgba.chunks_exact_mut(4) {
         let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
         let alpha = u16::from(a);
@@ -2789,5 +2806,30 @@ mod tests {
         )
         .unwrap();
         assert!(crop.pixels().iter().any(|value| *value != 0));
+    }
+
+    #[test]
+    fn pin_button_is_clickable_and_its_svg_renders_visible_pixels() {
+        let toolbar =
+            toolbar_layout(RectI { x: 100, y: 100, width: 600, height: 400 }, PixelSize { width: 1920, height: 1080 });
+        assert_eq!(toolbar.buttons.len(), TOOLBAR_COUNT as usize);
+        let (_, pin) = toolbar.buttons.iter().find(|(action, _)| *action == ToolbarAction::Pin).unwrap();
+        assert_eq!(toolbar.hit_test((f64::from(pin.x + 10), f64::from(pin.y + 10))), Some(ToolbarAction::Pin));
+        assert!(pin.x + pin.width <= toolbar.bounds.x + toolbar.bounds.width);
+        let mut raster = patch_raster(RectI { x: 0, y: 0, width: 24, height: 24 });
+        let (svg, color) = toolbar_icon(ToolbarAction::Pin);
+        assert!(svg.contains("<svg"));
+        draw_svg_icon(&mut raster, RectI { x: 0, y: 0, width: 24, height: 24 }, svg, color);
+        assert!(raster.pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
+    }
+
+    #[test]
+    fn pin_header_renders_close_button_without_modifying_pinned_pixels() {
+        let header = render_pin_header_patch(RectI { x: 100, y: 80, width: 200, height: 28 });
+        assert_eq!(header.len(), 200 * 28 * 4);
+        assert!(header.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
+        let close_pixels = header.as_chunks::<4>().0.iter().enumerate().filter(|(index, _)| index % 200 >= 172);
+        assert!(close_pixels.into_iter().any(|(_, pixel)| pixel[2] > 200 && pixel[1] < 150));
+        assert_eq!(render_pin_header_patch(RectI { x: 0, y: 0, width: 10, height: 9 }).len(), 10 * 9 * 4);
     }
 }

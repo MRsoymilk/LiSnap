@@ -128,6 +128,7 @@ fn run_interactive_capture(cli: &Cli) -> Result<(), String> {
         // The output callback already saved/copied the image and the editor
         // displayed its result. Do not perform the operation a second time.
         lisnap_platform::WaylandEditorOutcome::Accepted { .. } => Ok(()),
+        lisnap_platform::WaylandEditorOutcome::Pinned => Ok(()),
         lisnap_platform::WaylandEditorOutcome::Cancelled => Ok(()),
         lisnap_platform::WaylandEditorOutcome::Closed => {
             Err("Wayland compositor closed the interactive screenshot editor".into())
