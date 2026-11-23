@@ -822,6 +822,23 @@ pub(crate) fn render_magnifier_patch(preview: &MagnifierPreview) -> Vec<u8> {
         width: PIXEL_ZOOM,
         height: PIXEL_ZOOM,
     };
+    // Four high-contrast crosshair arms point at the sampled pixel without obscuring its color.
+    let grid_end_x = grid_x + PIXEL_GRID as i32 * PIXEL_ZOOM;
+    let grid_end_y = grid_y + PIXEL_GRID as i32 * PIXEL_ZOOM;
+    let cross_x = center.x + PIXEL_ZOOM / 2;
+    let cross_y = center.y + PIXEL_ZOOM / 2;
+    let arms = [
+        (RectI { x: cross_x, y: grid_y, width: 1, height: center.y - grid_y }, true),
+        (RectI { x: cross_x, y: center.y + PIXEL_ZOOM, width: 1, height: grid_end_y - center.y - PIXEL_ZOOM }, true),
+        (RectI { x: grid_x, y: cross_y, width: center.x - grid_x, height: 1 }, false),
+        (RectI { x: center.x + PIXEL_ZOOM, y: cross_y, width: grid_end_x - center.x - PIXEL_ZOOM, height: 1 }, false),
+    ];
+    for (arm, vertical) in arms {
+        let shadow =
+            if vertical { RectI { x: arm.x - 1, width: 3, ..arm } } else { RectI { y: arm.y - 1, height: 3, ..arm } };
+        raster.fill_rect(shadow, [0, 0, 0, 220]);
+        raster.fill_rect(arm, [255, 255, 255, 240]);
+    }
     // Black + white outlines remain visible on both light and dark sampled pixels.
     raster.draw_rect_outline(center, 3, [0, 0, 0, 255]);
     raster.draw_rect_outline(center, 1, [255, 255, 255, 255]);
@@ -2154,6 +2171,12 @@ mod tests {
         };
         assert_eq!(at(50, 34), &[64, 50, 50, 255]);
         assert_eq!(at(51, 35), at(50, 34));
+        // The crosshair is centered in both axes, stays inside the grid, and keeps the source pixel visible.
+        assert!(at(110, 40)[0] > 235);
+        assert!(at(109, 40)[0] < 40);
+        assert!(at(75, 94)[0] > 235);
+        assert!(at(75, 93)[0] < 40);
+        assert_eq!(at(43, 40), &[32, 27, 24, 255]);
         assert_eq!(at(110, 94), &[64, 100, 100, 255]);
         assert_eq!(at(104, 88), &[255, 255, 255, 255]);
         assert_eq!(at(20, 180), &[64, 100, 100, 255]);
