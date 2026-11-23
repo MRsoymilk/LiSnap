@@ -16,11 +16,11 @@ use super::annotation::{
     RectI as AnnotationRect, SELECTION_DIMENSIONS_SIZE, SelectionDimensions, TextDraft, ToolbarAction,
     annotation_damage_regions, annotation_hit_test, arrow_handle_hit_test, color_menu_layout, compose_annotated_crop,
     context_menu_layout, custom_color_menu_layout, custom_hue_at, custom_sat_value_at, custom_slider_value,
-    draft_damage_regions, key_to_ascii, normalized_rect, preload_system_font, render_annotations_patch_with_source,
-    render_context_menu_patch, render_draft_patch_with_move, render_feedback_patch, render_magnifier_patch,
-    render_pin_header_patch, render_selection_dimensions_patch, render_toolbar_patch_with_color,
-    rgba_to_wayland_argb_in_place, selected_annotation_damage, selected_annotation_hit_test,
-    selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
+    draft_damage_regions, key_to_ascii, normalized_rect, number_radius, preload_system_font,
+    render_annotations_patch_with_source, render_context_menu_patch, render_draft_patch_with_move,
+    render_feedback_patch, render_magnifier_patch, render_pin_header_patch, render_selection_dimensions_patch,
+    render_toolbar_patch_with_color, rgba_to_wayland_argb_in_place, selected_annotation_damage,
+    selected_annotation_hit_test, selection_dimensions_layout, toolbar_layout, translate_annotation_in_selection,
 };
 use super::feedback::{EditorFeedback, FEEDBACK_SIZE, feedback_layout};
 use super::magnifier::{MAGNIFIER_SIZE, magnifier_preview};
@@ -660,6 +660,7 @@ struct RuntimeState {
     text_draft: Option<TextDraft>,
     stroke_width: i32,
     font_size: i32,
+    number_size: i32,
     mosaic_block_size: i32,
     color_index: usize,
     custom_color: [u8; 4],
@@ -1210,6 +1211,7 @@ fn run_connection_mode(
         magnifier_enabled: true,
         stroke_width: 3,
         font_size: 24,
+        number_size: 24,
         mosaic_block_size: 18,
         custom_color: DEFAULT_COLOR,
         ..RuntimeState::default()
@@ -2118,7 +2120,13 @@ fn redraw_editor(state: &mut RuntimeState, connection: &Connection) {
             let pixels = if let Some(menu) = state.context_menu.as_ref() {
                 let selected = match menu.kind {
                     ContextMenuKind::Stroke => state.stroke_width,
-                    ContextMenuKind::Font => state.font_size,
+                    ContextMenuKind::Font => {
+                        if state.active_tool == EditorTool::Number {
+                            state.number_size
+                        } else {
+                            state.font_size
+                        }
+                    }
                     ContextMenuKind::Color => state.color_index as i32,
                     ContextMenuKind::CustomColor => PALETTE.len() as i32,
                     ContextMenuKind::Mosaic => state.mosaic_block_size,
@@ -2166,6 +2174,37 @@ fn add_annotation(state: &mut RuntimeState, annotation: Annotation) {
     state.redo_operations.clear();
     state.static_dirty = true;
     state.draft_dirty = true;
+}
+
+fn place_number(state: &mut RuntimeState, point: (f64, f64)) -> bool {
+    let Some(selection) = state.selection_logical else { return false };
+    if !selection.contains(point) {
+        return false;
+    }
+    let next = state
+        .annotations
+        .iter()
+        .chain(state.moving.iter().map(|moving| &moving.preview))
+        .filter_map(|annotation| match annotation {
+            Annotation::Number { value, .. } => Some(*value),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .checked_add(1);
+    let Some(value) = next else { return false };
+    let font_size = state.number_size.clamp(8, 96);
+    let radius = number_radius(value, font_size) + 3.0;
+    let axis = |point: f64, start: i32, length: i32| {
+        let start = f64::from(start);
+        let length = f64::from(length);
+        if length >= radius * 2.0 { point.clamp(start + radius, start + length - radius) } else { start + length / 2.0 }
+    };
+    let center = (axis(point.0, selection.x, selection.width), axis(point.1, selection.y, selection.height));
+    let color = active_annotation_color(state);
+    add_annotation(state, Annotation::Number { center, value, font_size, color });
+    state.drag_anchor = None;
+    true
 }
 
 fn begin_existing_text_edit(state: &mut RuntimeState, index: usize) -> bool {
@@ -2546,10 +2585,14 @@ fn apply_editor_context_choice(state: &mut RuntimeState, kind: ContextMenuKind, 
             }
         }
         ContextMenuKind::Font => {
-            state.font_size = value;
-            if let Some(text) = state.text_draft.as_mut() {
-                text.font_size = value;
-                reset_text_cursor_blink(state);
+            if state.active_tool == EditorTool::Number {
+                state.number_size = value;
+            } else {
+                state.font_size = value;
+                if let Some(text) = state.text_draft.as_mut() {
+                    text.font_size = value;
+                    reset_text_cursor_blink(state);
+                }
             }
         }
         ContextMenuKind::Mosaic => {
@@ -2648,10 +2691,15 @@ fn is_text_double_click(last: Option<(usize, Instant)>, index: usize, now: Insta
 }
 
 fn hit_editor_annotation(state: &RuntimeState, point: (f64, f64)) -> Option<usize> {
+    let eligible = |annotation: &Annotation| {
+        state.active_tool != EditorTool::Number || matches!(annotation, Annotation::Number { .. })
+    };
     state
         .selected_annotation
-        .filter(|index| state.annotations.get(*index).is_some_and(|ann| selected_annotation_hit_test(ann, point)))
-        .or_else(|| state.annotations.iter().rposition(|ann| annotation_hit_test(ann, point)))
+        .filter(|index| {
+            state.annotations.get(*index).is_some_and(|ann| eligible(ann) && selected_annotation_hit_test(ann, point))
+        })
+        .or_else(|| state.annotations.iter().rposition(|ann| eligible(ann) && annotation_hit_test(ann, point)))
 }
 
 fn text_draft_contains_point(draft: &TextDraft, point: (f64, f64)) -> bool {
@@ -2836,12 +2884,15 @@ fn begin_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection:
         return;
     }
 
-    // An empty-space click only clears selection; the next gesture draws.
+    // Numbering stays single-click for consecutive markers. Other tools retain
+    // the existing empty-space click to clear the current object selection.
     if state.selected_annotation.take().is_some() {
         state.last_text_click = None;
         state.draft_dirty = true;
-        redraw_editor(state, connection);
-        return;
+        if state.active_tool != EditorTool::Number {
+            redraw_editor(state, connection);
+            return;
+        }
     }
     state.last_text_click = None;
     let color = active_annotation_color(state);
@@ -2872,6 +2923,9 @@ fn begin_editor_pointer(state: &mut RuntimeState, point: (f64, f64), connection:
             state.text_draft = Some(text);
             reset_text_cursor_blink(state);
             state.drag_anchor = None;
+        }
+        EditorTool::Number => {
+            place_number(state, point);
         }
     }
     state.draft_dirty = true;
@@ -3123,6 +3177,7 @@ fn handle_editor_key(state: &mut RuntimeState, key: u32, pressed: bool, connecti
         19 => set_editor_tool(state, EditorTool::Rectangle, connection),
         30 => set_editor_tool(state, EditorTool::Arrow, connection),
         20 => set_editor_tool(state, EditorTool::Text, connection),
+        49 => set_editor_tool(state, EditorTool::Number, connection),
         ENTER_KEY => accept_editor(state, false),
         _ => {}
     }
@@ -4060,6 +4115,168 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, CompletionToastData> fo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn number_test_state() -> RuntimeState {
+        RuntimeState {
+            editor_enabled: true,
+            editing: true,
+            active_tool: EditorTool::Number,
+            logical_size: Some(PixelSize { width: 800, height: 600 }),
+            frame_size: Some(PixelSize { width: 800, height: 600 }),
+            selection_logical: Some(AnnotationRect { x: 50, y: 50, width: 600, height: 300 }),
+            selection_pixels: Some(PixelRect { x: 50, y: 50, width: 600, height: 300 }),
+            number_size: 24,
+            font_size: 24,
+            ..RuntimeState::default()
+        }
+    }
+
+    fn number_values(state: &RuntimeState) -> Vec<u32> {
+        state
+            .annotations
+            .iter()
+            .filter_map(|annotation| match annotation {
+                Annotation::Number { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn test_pointer_connection() -> (Connection, std::os::unix::net::UnixStream) {
+        // No host compositor is contacted. Pure editor transitions do not send
+        // requests when no render surfaces or text-input objects are installed.
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        (Connection::from_socket(client).unwrap(), server)
+    }
+
+    #[test]
+    fn consecutive_number_clicks_need_only_one_click_each_and_can_overlay_other_shapes() {
+        let (connection, _server) = test_pointer_connection();
+        let mut state = number_test_state();
+        add_annotation(
+            &mut state,
+            Annotation::Rectangle { start: (60.0, 60.0), end: (600.0, 300.0), width: 3, color: DEFAULT_COLOR },
+        );
+        for point in [(120.0, 120.0), (240.0, 120.0), (360.0, 120.0)] {
+            begin_editor_pointer(&mut state, point, &connection);
+            finish_editor_pointer(&mut state, &connection);
+        }
+        assert_eq!(number_values(&state), vec![1, 2, 3]);
+        assert_eq!(state.undo_operations.len(), 4);
+        assert!(state.draft_annotation.is_none());
+        assert!(state.moving.is_none());
+    }
+
+    #[test]
+    fn number_sequence_tracks_undo_redo_and_new_edits_without_skipping_values() {
+        let mut state = number_test_state();
+        for point in [(120.0, 120.0), (240.0, 120.0), (360.0, 120.0)] {
+            assert!(place_number(&mut state, point));
+        }
+        undo_editor(&mut state);
+        assert_eq!(number_values(&state), vec![1, 2]);
+        redo_editor(&mut state);
+        assert_eq!(number_values(&state), vec![1, 2, 3]);
+        undo_editor(&mut state);
+        assert!(place_number(&mut state, (480.0, 120.0)));
+        assert_eq!(number_values(&state), vec![1, 2, 3]);
+        assert!(state.redo_operations.is_empty());
+        let mut fresh = number_test_state();
+        assert!(place_number(&mut fresh, (120.0, 120.0)));
+        assert_eq!(number_values(&fresh), vec![1]);
+    }
+
+    #[test]
+    fn existing_number_can_be_moved_without_consuming_another_sequence_value() {
+        let (connection, _server) = test_pointer_connection();
+        let mut state = number_test_state();
+        place_number(&mut state, (120.0, 120.0));
+        let original = state.annotations[0].clone();
+        // A later rectangle must not mask number hit testing in numbering mode.
+        add_annotation(
+            &mut state,
+            Annotation::Rectangle { start: (60.0, 60.0), end: (600.0, 300.0), width: 3, color: DEFAULT_COLOR },
+        );
+        begin_editor_pointer(&mut state, (120.0, 120.0), &connection);
+        assert!(state.moving.is_some());
+        update_editor_pointer(&mut state, (170.0, 150.0), &connection);
+        finish_editor_pointer(&mut state, &connection);
+        assert_eq!(number_values(&state), vec![1]);
+        assert!(matches!(state.annotations[0], Annotation::Number { center: (170.0, 150.0), value: 1, .. }));
+        undo_editor(&mut state);
+        assert_eq!(state.annotations[0], original);
+        redo_editor(&mut state);
+        assert!(place_number(&mut state, (300.0, 150.0)));
+        assert_eq!(number_values(&state), vec![1, 2]);
+    }
+
+    #[test]
+    fn number_colors_and_size_preferences_are_independent_of_text_and_previous_markers() {
+        let mut state = number_test_state();
+        place_number(&mut state, (120.0, 120.0));
+        let original = state.annotations[0].clone();
+        state.custom_color_editor = Some(CustomColorEditor::new([12, 200, 145, 255]));
+        assert!(apply_custom_color_editor(&mut state));
+        apply_editor_context_choice(&mut state, ContextMenuKind::Font, 40);
+        assert_eq!(state.number_size, 40);
+        assert_eq!(state.font_size, 24);
+        place_number(&mut state, (300.0, 150.0));
+        assert_eq!(state.annotations[0], original);
+        assert!(matches!(
+            state.annotations[1],
+            Annotation::Number { value: 2, font_size: 40, color: [12, 200, 145, 255], .. }
+        ));
+    }
+
+    #[test]
+    fn number_markers_near_selection_edges_are_kept_inside_when_they_fit() {
+        let mut state = number_test_state();
+        let selection = state.selection_logical.unwrap();
+        assert!(place_number(&mut state, (51.0, 51.0)));
+        assert!(place_number(&mut state, (649.0, 349.0)));
+        for marker in &state.annotations {
+            let bounds = super::super::annotation::annotation_bounds(marker);
+            assert!(bounds.x >= selection.x && bounds.y >= selection.y);
+            assert!(bounds.x + bounds.width <= selection.x + selection.width);
+            assert!(bounds.y + bounds.height <= selection.y + selection.height);
+        }
+        assert!(!place_number(&mut state, (0.0, 0.0)));
+        assert!(!place_number(&mut state, (f64::NAN, 100.0)));
+        state.annotations.push(Annotation::Number {
+            center: (200.0, 150.0),
+            value: u32::MAX,
+            font_size: 24,
+            color: DEFAULT_COLOR,
+        });
+        assert!(!place_number(&mut state, (300.0, 150.0)), "numbering must not wrap to zero");
+    }
+
+    #[test]
+    fn number_shortcut_does_not_intercept_text_input_and_output_snapshots_keep_numbers() {
+        let (connection, _server) = test_pointer_connection();
+        let mut state = number_test_state();
+        state.active_tool = EditorTool::Pen;
+        handle_editor_key(&mut state, 49, true, &connection);
+        assert_eq!(state.active_tool, EditorTool::Number);
+        state.active_tool = EditorTool::Text;
+        state.text_draft = Some(TextDraft::new((100.0, 100.0)));
+        handle_editor_key(&mut state, 49, true, &connection);
+        assert_eq!(state.active_tool, EditorTool::Text);
+        assert_eq!(state.text_draft.as_ref().unwrap().text, "n");
+        state.text_draft = None;
+        place_number(&mut state, (120.0, 120.0));
+        for copy in [false, true] {
+            accept_editor(&mut state, copy);
+            let Some(RuntimeOutcome::Accepted { annotations, copy: actual_copy, .. }) = state.outcome.take() else {
+                panic!("output did not accept the numbered capture");
+            };
+            assert_eq!(actual_copy, copy);
+            assert!(matches!(annotations.as_slice(), [Annotation::Number { value: 1, .. }]));
+        }
+        pin_editor(&mut state);
+        assert!(matches!(state.outcome, Some(RuntimeOutcome::PinRequested { annotations, .. })
+            if matches!(annotations.as_slice(), [Annotation::Number { value: 1, .. }])));
+    }
 
     fn feedback_test_frame() -> CaptureFrame {
         let size = PixelSize { width: 20, height: 20 };

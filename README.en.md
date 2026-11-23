@@ -41,6 +41,7 @@ LiSnap is a work-in-progress desktop screenshot editor with a straightforward wo
 - **Live pixel dimensions:** Displays width × height (px) at the selection's top-left using actual capture pixels, including on scaled displays. The label is not included in saved or copied images.
 - **Pixel magnifier and color inspection:** A 12× magnifier follows the pointer, highlights the center pixel, and shows its HEX / RGB color and pixel coordinates. Samples come from the original frozen capture, not the mask or annotations. Press `M` to show/hide it; it hides automatically during drawing, text entry, and tool menus, and is excluded from exported images.
 - **Inline annotation:** Pen, rectangle, arrow, text, and mosaic, with selection/movement of existing annotations, draggable arrow endpoints, double-click text editing, and undo/redo.
+- **Circled numbers:** Choose Number or press `N`, then click to place 1, 2, 3… with centered digits inside an outlined circle. The circle grows for multi-digit values. Supports preset/custom colors, right-click size settings for subsequent markers, dragging existing markers, and undo/redo. Numbers are included in saved, copied, and pinned images.
 - **Pin to desktop:** The pin toolbar button keeps the selected image and its annotations above other windows. Drag the image or its header across connected monitors, including negative origins, vertically arranged monitors, and mixed display scales. Each monitor shows its corresponding image portion using logical positions from `zxdg_output`. Click the top-right close button or right-click to dismiss. Only the pin receives pointer input, without taking keyboard focus from other applications. Pinning does not save a file or change the clipboard.
 - **Flexible drawing styles:** 12 preset colors, custom HSV selection, RGB/HEX input, plus configurable line width, font size, and mosaic block size.
 - **Save or copy:** Save/Confirm writes an annotated PNG; Copy sends PNG data to the Wayland clipboard using `wl-copy` without creating an extra file.
@@ -113,6 +114,7 @@ For the complete CLI reference, run `cargo run -p lisnap -- --help`.
 | Resize selection | Drag any edge or one of eight handles after selecting; `Esc` cancels the resize, `Ctrl+Z` / `Ctrl+Y` undo/redo it. Existing annotations are retained and clipped to the new region |
 | Magnify pixels / Inspect colors | Move the pointer to inspect the center pixel's HEX / RGB color; `M` shows/hides the magnifier (except during text entry) |
 | Pen / Rectangle / Arrow / Text | Toolbar buttons or `P` / `R` / `A` / `T` |
+| Circled numbers | Number toolbar button or `N`; click repeatedly to place, drag existing numbers, right-click to set subsequent markers' size |
 | Mosaic | Select the mosaic tool and drag across a region |
 | Modify annotations | Click to select and drag; resize arrows by dragging endpoints; double-click text to edit |
 | Adjust styles | Open the leftmost color picker; right-click tool buttons for width, font size, or mosaic block size |

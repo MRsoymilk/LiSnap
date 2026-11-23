@@ -21,6 +21,7 @@ pub(crate) enum EditorTool {
     Rectangle,
     Arrow,
     Text,
+    Number,
     Mosaic,
 }
 
@@ -60,6 +61,7 @@ pub(crate) enum Annotation {
     Rectangle { start: (f64, f64), end: (f64, f64), width: i32, color: [u8; 4] },
     Arrow { start: (f64, f64), end: (f64, f64), width: i32, color: [u8; 4] },
     Text { position: (f64, f64), text: String, font_size: i32, color: [u8; 4] },
+    Number { center: (f64, f64), value: u32, font_size: i32, color: [u8; 4] },
     Mosaic { start: (f64, f64), end: (f64, f64), block_size: i32 },
 }
 
@@ -554,7 +556,7 @@ pub(crate) fn context_menu_layout(tool: EditorTool, point: (f64, f64), screen: P
     let width = STANDARD_MENU_WIDTH;
     let height = STANDARD_MENU_HEIGHT;
     let kind = match tool {
-        EditorTool::Text => ContextMenuKind::Font,
+        EditorTool::Text | EditorTool::Number => ContextMenuKind::Font,
         EditorTool::Mosaic => ContextMenuKind::Mosaic,
         _ => ContextMenuKind::Stroke,
     };
@@ -591,7 +593,7 @@ const TOOLBAR_BUTTON: i32 = 40;
 const TOOLBAR_GAP: i32 = 6;
 const TOOLBAR_PAD: i32 = 8;
 const TOOLBAR_HEIGHT: i32 = TOOLBAR_BUTTON + TOOLBAR_PAD * 2;
-const TOOLBAR_COUNT: i32 = 13;
+const TOOLBAR_COUNT: i32 = 14;
 
 const TEXT_SELECTION_COLOR: [u8; 4] = [77, 139, 233, 185];
 const TOOLBAR_BG: [u8; 4] = [24, 27, 32, 232];
@@ -610,6 +612,7 @@ const PEN_ICON: &str = include_str!("../../../../../res/icons/toolbar/pen.svg");
 const RECTANGLE_ICON: &str = include_str!("../../../../../res/icons/toolbar/rectangle.svg");
 const ARROW_ICON: &str = include_str!("../../../../../res/icons/toolbar/arrow.svg");
 const TEXT_ICON: &str = include_str!("../../../../../res/icons/toolbar/text.svg");
+const NUMBER_ICON: &str = include_str!("../../../../../res/icons/toolbar/number.svg");
 const MOSAIC_ICON: &str = include_str!("../../../../../res/icons/toolbar/mosaic.svg");
 const UNDO_ICON: &str = include_str!("../../../../../res/icons/toolbar/undo.svg");
 const REDO_ICON: &str = include_str!("../../../../../res/icons/toolbar/redo.svg");
@@ -651,6 +654,7 @@ pub(crate) fn toolbar_layout(selection: RectI, screen: PixelSize) -> ToolbarLayo
         ToolbarAction::Tool(EditorTool::Rectangle),
         ToolbarAction::Tool(EditorTool::Arrow),
         ToolbarAction::Tool(EditorTool::Text),
+        ToolbarAction::Tool(EditorTool::Number),
         ToolbarAction::Tool(EditorTool::Mosaic),
         ToolbarAction::Undo,
         ToolbarAction::Redo,
@@ -1207,6 +1211,9 @@ pub(crate) fn annotation_hit_test(annotation: &Annotation, point: (f64, f64)) ->
                 && point.1 >= position.1 - 5.0
                 && point.1 <= position.1 + height + 5.0
         }
+        Annotation::Number { center, value, font_size, .. } => {
+            point_distance(point, *center) <= number_radius(*value, *font_size) + 5.0
+        }
         Annotation::Mosaic { start, end, .. } => {
             point.0 >= start.0.min(end.0)
                 && point.0 <= start.0.max(end.0)
@@ -1262,6 +1269,15 @@ pub(crate) fn annotation_bounds(annotation: &Annotation) -> RectI {
                 y: position.1.floor() as i32 - 4,
                 width: width.ceil() as i32 + 12,
                 height: text.lines().count() as i32 * (*font_size + 4) + 12,
+            }
+        }
+        Annotation::Number { center, value, font_size, .. } => {
+            let radius = number_radius(*value, *font_size) + 2.0;
+            RectI {
+                x: (center.0 - radius).floor() as i32,
+                y: (center.1 - radius).floor() as i32,
+                width: (center.0 + radius).ceil() as i32 - (center.0 - radius).floor() as i32 + 1,
+                height: (center.1 + radius).ceil() as i32 - (center.1 - radius).floor() as i32 + 1,
             }
         }
         Annotation::Mosaic { start, end, .. } => RectI {
@@ -1390,6 +1406,9 @@ pub(crate) fn translate_annotation(annotation: &Annotation, dx: f64, dy: f64) ->
             font_size: *font_size,
             color: *color,
         },
+        Annotation::Number { center, value, font_size, color } => {
+            Annotation::Number { center: move_point(*center), value: *value, font_size: *font_size, color: *color }
+        }
         Annotation::Mosaic { start, end, block_size } => {
             Annotation::Mosaic { start: move_point(*start), end: move_point(*end), block_size: *block_size }
         }
@@ -1502,6 +1521,7 @@ fn toolbar_icon(action: ToolbarAction) -> (&'static str, [u8; 4]) {
         ToolbarAction::Tool(EditorTool::Rectangle) => (RECTANGLE_ICON, TOOLBAR_ICON),
         ToolbarAction::Tool(EditorTool::Arrow) => (ARROW_ICON, TOOLBAR_ICON),
         ToolbarAction::Tool(EditorTool::Text) => (TEXT_ICON, TOOLBAR_ICON),
+        ToolbarAction::Tool(EditorTool::Number) => (NUMBER_ICON, TOOLBAR_ICON),
         ToolbarAction::Tool(EditorTool::Mosaic) => (MOSAIC_ICON, TOOLBAR_ICON),
         ToolbarAction::Color => (PEN_ICON, TOOLBAR_ICON),
         ToolbarAction::Undo => (UNDO_ICON, TOOLBAR_ICON),
@@ -1520,6 +1540,19 @@ fn draw_svg_icon(raster: &mut Raster, bounds: RectI, svg: &str, color: [u8; 4]) 
     let origin_y = bounds.y + (bounds.height - icon_size) / 2;
     let scale = f64::from(icon_size) / ICON_VIEWBOX;
     let map = |x: f64, y: f64| (origin_x + (x * scale).round() as i32, origin_y + (y * scale).round() as i32);
+
+    visit_svg_tags(svg, "<circle", |tag| {
+        let (Some(cx), Some(cy), Some(radius)) = (svg_number(tag, "cx"), svg_number(tag, "cy"), svg_number(tag, "r"))
+        else {
+            return;
+        };
+        raster.draw_ellipse_outline(
+            (f64::from(origin_x) + cx * scale, f64::from(origin_y) + cy * scale),
+            (radius * scale, radius * scale),
+            svg_number(tag, "stroke-width").unwrap_or(2.0) * scale,
+            color,
+        );
+    });
 
     visit_svg_tags(svg, "<line", |tag| {
         let Some(x1) = svg_number(tag, "x1") else { return };
@@ -1610,6 +1643,9 @@ fn draw_annotation(raster: &mut Raster, annotation: &Annotation, sx: f64, sy: f6
         }
         Annotation::Text { position, text, font_size, color } => {
             draw_text(raster, *position, text, *font_size, *color, sx, sy);
+        }
+        Annotation::Number { center, value, font_size, color } => {
+            draw_number(raster, *center, *value, *font_size, *color, sx, sy);
         }
         Annotation::Mosaic { start, end, block_size } => {
             draw_mosaic(raster, *start, *end, *block_size, sx, sy, source);
@@ -1741,6 +1777,69 @@ fn draw_arrow(raster: &mut Raster, start: (i32, i32), end: (i32, i32), width: i3
     let right = ((base.0 - -uy * side).round() as i32, (base.1 - ux * side).round() as i32);
     raster.draw_line(end, left, width, color);
     raster.draw_line(end, right, width, color);
+}
+
+struct NumberMetrics {
+    scale: i32,
+    first_column: i32,
+    width: i32,
+    height: i32,
+    radius: f64,
+}
+
+fn number_metrics(value: u32, font_size: i32) -> NumberMetrics {
+    let scale = (font_size.clamp(8, 96) + 4) / 8;
+    let mut first = i32::MAX;
+    let mut last = 0;
+    for (index, digit) in value.to_string().chars().enumerate() {
+        for bits in glyph5x7(digit) {
+            for col in 0..5 {
+                if bits & (1 << (4 - col)) != 0 {
+                    let column = index as i32 * 6 + col;
+                    first = first.min(column);
+                    last = last.max(column);
+                }
+            }
+        }
+    }
+    let width = (last - first + 1) * scale;
+    let height = 7 * scale;
+    let radius = (f64::from(width).hypot(f64::from(height)) / 2.0 + 4.0).ceil();
+    NumberMetrics { scale, first_column: first, width, height, radius }
+}
+
+pub(crate) fn number_radius(value: u32, font_size: i32) -> f64 {
+    number_metrics(value, font_size).radius
+}
+
+fn draw_number(raster: &mut Raster, center: (f64, f64), value: u32, font_size: i32, color: [u8; 4], sx: f64, sy: f64) {
+    let metrics = number_metrics(value, font_size);
+    raster.draw_ellipse_outline(
+        (center.0 * sx, center.1 * sy),
+        (metrics.radius * sx, metrics.radius * sy),
+        f64::from(scaled_width(sx, sy, 2.0)),
+        color,
+    );
+    // Center the actual digit ink (not its side bearings), including multi-digit
+    // values. Bitmap digits are deterministic and do not depend on font loading.
+    let left = center.0 - f64::from(metrics.width) / 2.0;
+    let top = center.1 - f64::from(metrics.height) / 2.0;
+    for (index, digit) in value.to_string().chars().enumerate() {
+        for (row, bits) in glyph5x7(digit).into_iter().enumerate() {
+            for col in 0..5 {
+                if bits & (1 << (4 - col)) == 0 {
+                    continue;
+                }
+                let x = left + f64::from((index as i32 * 6 + col - metrics.first_column) * metrics.scale);
+                let y = top + f64::from(row as i32 * metrics.scale);
+                let x1 = (x * sx).round() as i32;
+                let y1 = (y * sy).round() as i32;
+                let x2 = ((x + f64::from(metrics.scale)) * sx).round() as i32;
+                let y2 = ((y + f64::from(metrics.scale)) * sy).round() as i32;
+                raster.fill_rect(RectI { x: x1, y: y1, width: x2 - x1, height: y2 - y1 }, color);
+            }
+        }
+    }
 }
 
 fn draw_text(raster: &mut Raster, position: (f64, f64), text: &str, font_size: i32, color: [u8; 4], sx: f64, sy: f64) {
@@ -1877,6 +1976,41 @@ struct Raster {
 }
 
 impl Raster {
+    fn draw_ellipse_outline(&mut self, center: (f64, f64), radius: (f64, f64), width: f64, color: [u8; 4]) {
+        if radius.0 <= 0.0 || radius.1 <= 0.0 {
+            return;
+        }
+        let margin = width / 2.0 + 1.0;
+        let x1 = (center.0 - radius.0 - margin).floor() as i32;
+        let y1 = (center.1 - radius.1 - margin).floor() as i32;
+        let x2 = (center.0 + radius.0 + margin).ceil() as i32;
+        let y2 = (center.1 + radius.1 + margin).ceil() as i32;
+        let backing = RectI {
+            x: self.origin.0,
+            y: self.origin.1,
+            width: self.size.width as i32,
+            height: self.size.height as i32,
+        };
+        let bounds = RectI { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
+        let Some(bounds) = intersect_rect(bounds, backing)
+            .and_then(|bounds| self.clip.map_or(Some(bounds), |clip| intersect_rect(bounds, clip)))
+        else {
+            return;
+        };
+        for y in bounds.y..bounds.y + bounds.height {
+            for x in bounds.x..bounds.x + bounds.width {
+                let dx = (f64::from(x) + 0.5 - center.0) / radius.0;
+                let dy = (f64::from(y) + 0.5 - center.1) / radius.1;
+                let distance = (dx.hypot(dy) - 1.0).abs() * radius.0.min(radius.1);
+                let coverage = (width / 2.0 + 0.5 - distance).clamp(0.0, 1.0);
+                if coverage > 0.0 {
+                    let alpha = (f64::from(color[3]) * coverage).round() as u8;
+                    self.blend_pixel(x, y, [color[0], color[1], color[2], alpha]);
+                }
+            }
+        }
+    }
+
     fn blit_rgba(&mut self, rect: RectI, pixels: &[u8]) {
         let width = rect.width.max(0) as usize;
         let height = rect.height.max(0) as usize;
@@ -2279,6 +2413,7 @@ mod tests {
             ToolbarAction::Tool(EditorTool::Rectangle),
             ToolbarAction::Tool(EditorTool::Arrow),
             ToolbarAction::Tool(EditorTool::Text),
+            ToolbarAction::Tool(EditorTool::Number),
             ToolbarAction::Tool(EditorTool::Mosaic),
             ToolbarAction::Undo,
             ToolbarAction::Redo,
@@ -2854,5 +2989,118 @@ mod tests {
         let close_pixels = header.as_chunks::<4>().0.iter().enumerate().filter(|(index, _)| index % 200 >= 172);
         assert!(close_pixels.into_iter().any(|(_, pixel)| pixel[2] > 200 && pixel[1] < 150));
         assert_eq!(render_pin_header_patch(RectI { x: 0, y: 0, width: 10, height: 9 }).len(), 10 * 9 * 4);
+    }
+
+    #[test]
+    fn number_marker_has_an_outline_circle_and_a_visible_center_digit() {
+        let marker = Annotation::Number { center: (60.0, 60.0), value: 8, font_size: 24, color: DEFAULT_COLOR };
+        let rect = RectI { x: 0, y: 0, width: 120, height: 120 };
+        let pixels = render_annotations_patch(rect, std::slice::from_ref(&marker));
+        let at = |x: usize, y: usize| &pixels[(y * 120 + x) * 4..(y * 120 + x) * 4 + 4];
+        assert!(at(60, 60)[3] > 200, "center digit is missing");
+        assert!(at(60, 43)[3] > 200, "top circle outline is missing");
+        assert!(at(43, 60)[3] > 200, "left circle outline is missing");
+        assert_eq!(at(60, 48)[3], 0, "circle interior must not be filled");
+        assert_eq!(at(40, 40)[3], 0);
+        let bounds = annotation_bounds(&marker);
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            if pixel[3] != 0 {
+                assert!(bounds.contains(((index % 120) as f64, (index / 120) as f64)));
+            }
+        }
+    }
+
+    #[test]
+    fn all_digits_are_centered_and_multi_digit_values_fit_inside_the_circle() {
+        for value in [1, 8, 10, 11, 99, 100, 1234, u32::MAX] {
+            let metrics = number_metrics(value, 24);
+            assert!(metrics.radius >= f64::from(metrics.width).hypot(f64::from(metrics.height)) / 2.0 + 4.0);
+            let mut raster = patch_raster(RectI { x: 0, y: 0, width: 300, height: 300 });
+            draw_number(&mut raster, (150.0, 150.0), value, 24, DEFAULT_COLOR, 1.0, 1.0);
+            let mut min_x = 300;
+            let mut max_x = 0;
+            let mut min_y = 300;
+            let mut max_y = 0;
+            for y in 150 - metrics.height / 2 - 1..=150 + metrics.height / 2 + 1 {
+                for x in 150 - metrics.width / 2 - 1..=150 + metrics.width / 2 + 1 {
+                    if raster.pixels[(y as usize * 300 + x as usize) * 4 + 3] != 0 {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+            assert!(
+                (f64::from(min_x + max_x + 1) / 2.0 - 150.0).abs() <= 0.5,
+                "value {value} is not horizontally centered"
+            );
+            assert!(
+                (f64::from(min_y + max_y + 1) / 2.0 - 150.0).abs() <= 0.5,
+                "value {value} is not vertically centered"
+            );
+        }
+        assert!(number_radius(100, 24) > number_radius(1, 24));
+        assert!(number_radius(1, 48) > number_radius(1, 16));
+    }
+
+    #[test]
+    fn number_annotations_support_hit_testing_movement_and_damage() {
+        let marker = Annotation::Number { center: (60.0, 60.0), value: 17, font_size: 24, color: PALETTE[6].1 };
+        assert!(annotation_hit_test(&marker, (60.0, 60.0)));
+        assert!(annotation_hit_test(&marker, (80.0, 60.0)));
+        assert!(!annotation_hit_test(&marker, (110.0, 110.0)));
+        let moved = translate_annotation(&marker, 25.0, 15.0);
+        assert_eq!(moved, Annotation::Number { center: (85.0, 75.0), value: 17, font_size: 24, color: PALETTE[6].1 });
+        let selection = RectI { x: 0, y: 0, width: 120, height: 120 };
+        let constrained = translate_annotation_in_selection(&marker, 1000.0, 1000.0, selection);
+        let bounds = annotation_bounds(&constrained);
+        assert!(bounds.x + bounds.width <= 120 && bounds.y + bounds.height <= 120);
+        assert_eq!(annotation_damage_regions(&marker, selection), vec![annotation_bounds(&marker)]);
+    }
+
+    #[test]
+    fn number_export_uses_actual_axis_scales_and_leaves_original_capture_unchanged() {
+        let size = PixelSize { width: 200, height: 300 };
+        let background = [12, 34, 56, 255].repeat(200 * 300);
+        let frame = CaptureFrame {
+            screen: ScreenInfo {
+                id: "DP-1".into(),
+                name: "Display".into(),
+                logical_geometry: None,
+                pixel_size: size,
+                scale_factor: Some(2.0),
+            },
+            image: RgbaImage::new(size, background.clone()).unwrap(),
+            captured_at: SystemTime::now(),
+        };
+        let marker = Annotation::Number { center: (50.0, 50.0), value: 8, font_size: 24, color: DEFAULT_COLOR };
+        let crop = compose_annotated_crop(
+            &frame,
+            PixelSize { width: 100, height: 100 },
+            PixelRect { x: 20, y: 30, width: 160, height: 240 },
+            &[marker],
+        )
+        .unwrap();
+        let at = |x: usize, y: usize| &crop.pixels()[(y * 160 + x) * 4..(y * 160 + x) * 4 + 4];
+        assert_eq!(at(80, 120), &DEFAULT_COLOR);
+        assert_eq!(at(80, 69), &DEFAULT_COLOR);
+        assert_eq!(at(0, 0), &[12, 34, 56, 255]);
+        assert_eq!(frame.image.pixels(), background);
+    }
+
+    #[test]
+    fn numbering_tool_uses_font_menu_and_the_toolbar_exposes_its_button() {
+        let screen = PixelSize { width: 1280, height: 720 };
+        let toolbar = toolbar_layout(RectI { x: 100, y: 100, width: 500, height: 300 }, screen);
+        let (_, button) =
+            toolbar.buttons.iter().find(|(action, _)| *action == ToolbarAction::Tool(EditorTool::Number)).unwrap();
+        assert_eq!(
+            toolbar.hit_test((f64::from(button.x + 10), f64::from(button.y + 10))),
+            Some(ToolbarAction::Tool(EditorTool::Number))
+        );
+        let menu = context_menu_layout(EditorTool::Number, (200.0, 200.0), screen);
+        assert_eq!(menu.kind, ContextMenuKind::Font);
+        assert!(menu.options.iter().any(|(size, _)| *size == 24));
     }
 }
