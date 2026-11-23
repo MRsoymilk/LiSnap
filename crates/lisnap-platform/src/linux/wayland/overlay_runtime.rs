@@ -24,7 +24,7 @@ use super::annotation::{
 };
 use super::feedback::{EditorFeedback, FEEDBACK_SIZE, feedback_layout};
 use super::magnifier::{MAGNIFIER_SIZE, magnifier_preview};
-use super::pin::{PinInteraction, PinLayout, pin_layout};
+use super::pin::{PinInteraction, PinLayout, clip_surface, global_pointer, intersect, pin_layout};
 use super::selection::{ResizeHandle, resize_handle_rects, resize_hit_test, resized_selection};
 use rustix::{
     event::{PollFd, PollFlags, poll},
@@ -43,6 +43,7 @@ use wayland_protocols::wp::{
     text_input::zv3::client::{zwp_text_input_manager_v3, zwp_text_input_v3},
     viewporter::client::{wp_viewport, wp_viewporter},
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 const WL_COMPOSITOR_MAX_VERSION: u32 = 6;
@@ -53,6 +54,7 @@ const LAYER_SHELL: &str = "zwlr_layer_shell_v1";
 const VIEWPORTER: &str = "wp_viewporter";
 const TEXT_INPUT_MANAGER_V3: &str = "zwp_text_input_manager_v3";
 const CURSOR_SHAPE_MANAGER_V1: &str = "wp_cursor_shape_manager_v1";
+const XDG_OUTPUT_MANAGER: &str = "zxdg_output_manager_v1";
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const ESC_KEY: u32 = 1;
@@ -115,6 +117,9 @@ enum RuntimeOutcome {
 struct OutputRecord {
     proxy: wl_output::WlOutput,
     name: Option<String>,
+    xdg_output: Option<zxdg_output_v1::ZxdgOutputV1>,
+    logical_position: Option<(i32, i32)>,
+    logical_size: Option<PixelSize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +159,6 @@ enum EditorLayerKind {
     Draft,
     Toolbar,
     Menu,
-    PinnedHeader,
 }
 
 #[derive(Debug)]
@@ -203,22 +207,55 @@ struct EditorSurfaces {
 
 #[derive(Debug)]
 struct PinnedImage {
-    image: OverlayQuad,
-    header: EditorLayer,
+    views: Vec<PinOutputView>,
     image_buffer: wl_buffer::WlBuffer,
+    image_size: PixelSize,
+    header_buffer: wl_buffer::WlBuffer,
+    header_size: PixelSize,
     backdrop_buffer: wl_buffer::WlBuffer,
     interaction: PinInteraction,
+    pointer_output: Option<u32>,
     _file: File,
+}
+
+#[derive(Debug, Clone)]
+struct PinOutputSpec {
+    global_name: u32,
+    proxy: wl_output::WlOutput,
+    logical: AnnotationRect,
+    source: bool,
+}
+
+#[derive(Debug)]
+struct PinOutputView {
+    global_name: u32,
+    logical: AnnotationRect,
+    parent: wl_surface::WlSurface,
+    viewport: wp_viewport::WpViewport,
+    layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    image: OverlayQuad,
+    header: OverlayQuad,
+    configured: bool,
+    mapped: bool,
+}
+
+#[derive(Debug)]
+struct PinOutputData {
+    global_name: u32,
 }
 
 impl PinnedImage {
     fn new(
         factory: &EditorLayerFactory<'_>,
         viewporter: &wp_viewporter::WpViewporter,
+        layer_shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
         image: &RgbaImage,
         layout: PinLayout,
-        screen: PixelSize,
+        outputs: &[PinOutputSpec],
+        source_viewport: &wp_viewport::WpViewport,
     ) -> Result<Self, CaptureError> {
+        let interaction = PinInteraction::with_outputs(layout, outputs.iter().map(|output| output.logical).collect())
+            .ok_or_else(|| CaptureError::InvalidFrame("invalid multi-output pin layout".into()))?;
         let size = image.size();
         let width =
             i32::try_from(size.width).map_err(|_| CaptureError::InvalidFrame("pin image is too wide".into()))?;
@@ -226,12 +263,19 @@ impl PinnedImage {
             i32::try_from(size.height).map_err(|_| CaptureError::InvalidFrame("pin image is too tall".into()))?;
         let stride =
             width.checked_mul(4).ok_or_else(|| CaptureError::InvalidFrame("pin image stride overflow".into()))?;
-        let byte_len = image
+        let header_bounds = AnnotationRect { x: 0, y: 0, width: layout.bounds.width, height: layout.header_height };
+        let header_pixels = render_pin_header_patch(header_bounds);
+        let header_offset = image
             .pixels()
             .len()
             .checked_add(4)
             .and_then(|len| i32::try_from(len).ok())
             .ok_or_else(|| CaptureError::InvalidFrame("pin image SHM exceeds protocol range".into()))?;
+        let byte_len = usize::try_from(header_offset)
+            .ok()
+            .and_then(|len| len.checked_add(header_pixels.len()))
+            .and_then(|len| i32::try_from(len).ok())
+            .ok_or_else(|| CaptureError::InvalidFrame("pin header SHM exceeds protocol range".into()))?;
         let name = CString::new("lisnap-pinned-image")
             .map_err(|_| CaptureError::BackendFailure("invalid pin memfd name".into()))?;
         let fd = memfd_create(name.as_c_str(), MemfdFlags::CLOEXEC)
@@ -243,66 +287,184 @@ impl PinnedImage {
         rgba_to_wayland_argb_in_place(&mut pixels);
         file.write_all(&[0; 4])
             .and_then(|_| file.write_all(&pixels))
+            .and_then(|_| file.write_all(&header_pixels))
             .map_err(|error| CaptureError::BackendFailure(format!("writing pin SHM failed: {error}")))?;
         let pool = factory.shm.create_pool(file.as_fd(), byte_len, factory.queue_handle, ());
         let backdrop_buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, factory.queue_handle, ());
         let image_buffer =
             pool.create_buffer(4, width, height, stride, wl_shm::Format::Argb8888, factory.queue_handle, ());
-        pool.destroy();
-        let image_surface = OverlayVisuals::create_quad(
-            factory.compositor,
-            factory.subcompositor,
-            viewporter,
-            factory.parent,
+        let header_stride = layout
+            .bounds
+            .width
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::InvalidFrame("pin header stride overflow".into()))?;
+        let header_buffer = pool.create_buffer(
+            header_offset,
+            layout.bounds.width,
+            layout.header_height,
+            header_stride,
+            wl_shm::Format::Argb8888,
             factory.queue_handle,
+            (),
         );
-        image_surface.viewport.set_destination(layout.image.width, layout.image.height);
-        image_surface.surface.attach(Some(&image_buffer), 0, 0);
-        image_surface.surface.damage_buffer(0, 0, width, height);
-        image_surface.surface.commit();
-        let header_factory = EditorLayerFactory {
-            size: PixelSize { width: layout.bounds.width as u32, height: layout.header_height as u32 },
-            ..*factory
-        };
-        let mut header =
-            EditorLayer::new(EditorLayerKind::PinnedHeader, &header_factory, Some(&image_surface.surface))?;
-        let bounds = AnnotationRect { x: 0, y: 0, width: layout.bounds.width, height: layout.header_height };
-        header.redraw_patch(bounds, &render_pin_header_patch(bounds))?;
+        pool.destroy();
+        let mut views = Vec::new();
+        for output in outputs {
+            views.push(PinOutputView::new(factory, viewporter, layer_shell, output, source_viewport));
+        }
         Ok(Self {
-            image: image_surface,
-            header,
+            views,
             image_buffer,
+            image_size: size,
+            header_buffer,
+            header_size: PixelSize { width: layout.bounds.width as u32, height: layout.header_height as u32 },
             backdrop_buffer,
-            interaction: PinInteraction::new(layout, screen),
+            interaction,
+            pointer_output: outputs.iter().find(|output| output.source).map(|output| output.global_name),
             _file: file,
         })
     }
 
-    fn present(
-        &self,
-        compositor: &wl_compositor::WlCompositor,
-        parent: &wl_surface::WlSurface,
-        queue_handle: &QueueHandle<RuntimeState>,
-    ) {
+    fn present(&mut self, compositor: &wl_compositor::WlCompositor, queue_handle: &QueueHandle<RuntimeState>) {
         let layout = self.interaction.layout;
-        self.image.subsurface.set_position(layout.image.x, layout.image.y);
-        self.header.subsurface.set_position(layout.bounds.x, layout.bounds.y);
-        // All pointer events use this stationary parent. Only the visible card
-        // receives input; the rest of the desktop stays fully interactive.
-        let region = compositor.create_region(queue_handle, ());
-        region.add(layout.bounds.x, layout.bounds.y, layout.bounds.width, layout.bounds.height);
-        parent.set_input_region(Some(&region));
-        region.destroy();
-        parent.commit();
+        for view in &mut self.views {
+            if !view.configured {
+                continue;
+            }
+            Self::present_quad(&view.image, &self.image_buffer, layout.image, view.logical, self.image_size);
+            Self::present_quad(
+                &view.header,
+                &self.header_buffer,
+                AnnotationRect { height: layout.header_height, ..layout.bounds },
+                view.logical,
+                self.header_size,
+            );
+            let region = compositor.create_region(queue_handle, ());
+            if let Some(visible) = intersect(layout.bounds, view.logical) {
+                region.add(visible.x - view.logical.x, visible.y - view.logical.y, visible.width, visible.height);
+            }
+            view.parent.set_input_region(Some(&region));
+            region.destroy();
+            if !view.mapped {
+                view.parent.attach(Some(&self.backdrop_buffer), 0, 0);
+                view.parent.damage_buffer(0, 0, 1, 1);
+                view.mapped = true;
+            }
+            view.parent.commit();
+        }
+    }
+
+    fn present_quad(
+        quad: &OverlayQuad,
+        buffer: &wl_buffer::WlBuffer,
+        surface: AnnotationRect,
+        output: AnnotationRect,
+        pixels: PixelSize,
+    ) {
+        if let Some(clip) = clip_surface(surface, output, pixels) {
+            let (x, y, width, height) = clip.source;
+            quad.viewport.set_source(x, y, width, height);
+            quad.viewport.set_destination(clip.destination.width, clip.destination.height);
+            quad.subsurface.set_position(clip.destination.x, clip.destination.y);
+            quad.surface.attach(Some(buffer), 0, 0);
+            quad.surface.damage_buffer(0, 0, pixels.width as i32, pixels.height as i32);
+        } else {
+            quad.surface.attach(None, 0, 0);
+        }
+        quad.surface.commit();
+    }
+
+    fn pointer_position(&self, point: (f64, f64)) -> Option<(f64, f64)> {
+        let view = self.views.iter().find(|view| Some(view.global_name) == self.pointer_output)?;
+        Some(global_pointer(view.logical, point))
     }
 
     fn destroy(self) {
-        self.header.destroy();
-        self.image.viewport.destroy();
-        self.image.subsurface.destroy();
-        self.image.surface.destroy();
+        for view in self.views {
+            view.destroy();
+        }
         self.image_buffer.destroy();
+        self.header_buffer.destroy();
         self.backdrop_buffer.destroy();
+    }
+}
+
+impl PinOutputView {
+    fn new(
+        factory: &EditorLayerFactory<'_>,
+        viewporter: &wp_viewporter::WpViewporter,
+        layer_shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        output: &PinOutputSpec,
+        source_viewport: &wp_viewport::WpViewport,
+    ) -> Self {
+        let (parent, viewport, layer_surface) = if output.source {
+            (factory.parent.clone(), source_viewport.clone(), None)
+        } else {
+            let parent = factory.compositor.create_surface(factory.queue_handle, ());
+            let input = factory.compositor.create_region(factory.queue_handle, ());
+            parent.set_input_region(Some(&input));
+            input.destroy();
+            let layer = layer_shell.get_layer_surface(
+                &parent,
+                Some(&output.proxy),
+                zwlr_layer_shell_v1::Layer::Overlay,
+                "lisnap-pin".into(),
+                factory.queue_handle,
+                PinOutputData { global_name: output.global_name },
+            );
+            layer.set_size(0, 0);
+            layer.set_anchor(
+                zwlr_layer_surface_v1::Anchor::Top
+                    | zwlr_layer_surface_v1::Anchor::Bottom
+                    | zwlr_layer_surface_v1::Anchor::Left
+                    | zwlr_layer_surface_v1::Anchor::Right,
+            );
+            layer.set_exclusive_zone(-1);
+            layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+            let viewport = viewporter.get_viewport(&parent, factory.queue_handle, ());
+            viewport.set_destination(output.logical.width, output.logical.height);
+            parent.commit();
+            (parent, viewport, Some(layer))
+        };
+        let image = OverlayVisuals::create_quad(
+            factory.compositor,
+            factory.subcompositor,
+            viewporter,
+            &parent,
+            factory.queue_handle,
+        );
+        let header = OverlayVisuals::create_quad(
+            factory.compositor,
+            factory.subcompositor,
+            viewporter,
+            &parent,
+            factory.queue_handle,
+        );
+        header.subsurface.place_above(&image.surface);
+        Self {
+            global_name: output.global_name,
+            logical: output.logical,
+            parent,
+            viewport,
+            layer_surface,
+            image,
+            header,
+            configured: output.source,
+            mapped: false,
+        }
+    }
+
+    fn destroy(self) {
+        for quad in [self.image, self.header] {
+            quad.viewport.destroy();
+            quad.subsurface.destroy();
+            quad.surface.destroy();
+        }
+        if let Some(layer) = self.layer_surface {
+            self.viewport.destroy();
+            layer.destroy();
+            self.parent.destroy();
+        }
     }
 }
 
@@ -440,6 +602,7 @@ struct RuntimeState {
     layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     shm: Option<wl_shm::WlShm>,
     viewporter: Option<wp_viewporter::WpViewporter>,
+    xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
     cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
@@ -892,10 +1055,7 @@ impl EditorSurfaces {
 
     fn mark_released(&mut self, layer: EditorLayerKind, slot: usize) {
         match layer {
-            EditorLayerKind::Dimensions
-            | EditorLayerKind::Magnifier
-            | EditorLayerKind::Feedback
-            | EditorLayerKind::PinnedHeader => {}
+            EditorLayerKind::Dimensions | EditorLayerKind::Magnifier | EditorLayerKind::Feedback => {}
             EditorLayerKind::Static => self.static_layer.mark_released(slot),
             EditorLayerKind::Draft => self.draft_layer.mark_released(slot),
             EditorLayerKind::Toolbar => self.toolbar_layer.mark_released(slot),
@@ -1063,6 +1223,16 @@ fn run_connection_mode(
         "Wayland overlay registry initialization",
     )?;
     bounded_roundtrip(&display, &queue_handle, &mut event_queue, &mut state, "Wayland overlay output initialization")?;
+    bind_xdg_outputs(&mut state, &queue_handle);
+    if state.xdg_output_manager.is_some() {
+        bounded_roundtrip(
+            &display,
+            &queue_handle,
+            &mut event_queue,
+            &mut state,
+            "Wayland logical output initialization",
+        )?;
+    }
 
     let compositor = state
         .compositor
@@ -1378,15 +1548,56 @@ fn show_pinned_capture(
         return Ok(());
     };
     let image = compose_annotated_crop(frame, logical_size, selection, &annotations)?;
-    let layout = pin_layout(display, logical_size).ok_or(CaptureError::InvalidSelection)?;
-    let (Some(compositor), Some(subcompositor), Some(shm), Some(viewporter), Some(parent), Some(viewport)) = (
+    let source_output = state
+        .editor_output
+        .as_ref()
+        .ok_or_else(|| CaptureError::BackendFailure("missing source output for pin".into()))?;
+    let mut outputs = Vec::new();
+    for (global_name, output) in &state.outputs {
+        let source = output.proxy == *source_output;
+        let logical = match (output.logical_position, output.logical_size) {
+            (Some((x, y)), Some(size)) => AnnotationRect { x, y, width: size.width as i32, height: size.height as i32 },
+            _ if state.outputs.len() == 1 => {
+                AnnotationRect { x: 0, y: 0, width: logical_size.width as i32, height: logical_size.height as i32 }
+            }
+            _ => {
+                return Err(CaptureError::Unsupported(
+                    "cross-monitor pinning requires zxdg_output logical positions and sizes".into(),
+                ));
+            }
+        };
+        let logical = if source {
+            AnnotationRect { width: logical_size.width as i32, height: logical_size.height as i32, ..logical }
+        } else {
+            logical
+        };
+        outputs.push(PinOutputSpec { global_name: *global_name, proxy: output.proxy.clone(), logical, source });
+    }
+    let source = outputs
+        .iter()
+        .find(|output| output.source)
+        .ok_or_else(|| CaptureError::BackendFailure("source output disappeared before pinning".into()))?;
+    let layout = pin_layout(display, logical_size)
+        .and_then(|layout| layout.translated(source.logical.x, source.logical.y))
+        .ok_or(CaptureError::InvalidSelection)?;
+    let (
+        Some(compositor),
+        Some(subcompositor),
+        Some(shm),
+        Some(viewporter),
+        Some(parent),
+        Some(viewport),
+        Some(layer_shell),
+    ) = (
         state.compositor.clone(),
         state.subcompositor.clone(),
         state.shm.clone(),
         state.viewporter.clone(),
         state.editor_surface.clone(),
         state.editor_viewport.clone(),
-    ) else {
+        state.layer_shell.clone(),
+    )
+    else {
         return Err(CaptureError::BackendFailure("missing Wayland objects for pinned image".into()));
     };
     let factory = EditorLayerFactory {
@@ -1397,7 +1608,7 @@ fn show_pinned_capture(
         size: logical_size,
         queue_handle,
     };
-    let pin = PinnedImage::new(&factory, &viewporter, &image, layout, logical_size)?;
+    let mut pin = PinnedImage::new(&factory, &viewporter, &layer_shell, &image, layout, &outputs, &viewport)?;
     if let Some(layer_surface) = state.editor_layer_surface.as_ref() {
         layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
     }
@@ -1411,9 +1622,8 @@ fn show_pinned_capture(
     // Keep a stable parent coordinate system for smooth dragging, but replace
     // the frozen screen with a transparent pixel. Only the pin itself is opaque.
     viewport.set_destination(logical_size.width as i32, logical_size.height as i32);
-    parent.attach(Some(&pin.backdrop_buffer), 0, 0);
     parent.damage(0, 0, logical_size.width as i32, logical_size.height as i32);
-    pin.present(&compositor, &parent, queue_handle);
+    pin.present(&compositor, queue_handle);
     state.pinned_image = Some(pin);
     connection.flush().map_err(|error| CaptureError::BackendFailure(format!("showing pinned image failed: {error}")))
 }
@@ -3014,7 +3224,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for RuntimeState {
         registry: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _data: &(),
-        _connection: &Connection,
+        connection: &Connection,
         queue_handle: &QueueHandle<Self>,
     ) {
         match event {
@@ -3032,6 +3242,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for RuntimeState {
             }
             wl_registry::Event::Global { name, interface, version } if interface == VIEWPORTER => {
                 state.viewporter = Some(registry.bind(name, version.min(1), queue_handle, ()));
+            }
+            wl_registry::Event::Global { name, interface, version } if interface == XDG_OUTPUT_MANAGER => {
+                state.xdg_output_manager = Some(registry.bind(name, version.min(3), queue_handle, ()));
+                bind_xdg_outputs(state, queue_handle);
             }
             wl_registry::Event::Global { name, interface, version } if interface == CURSOR_SHAPE_MANAGER_V1 => {
                 state.cursor_shape_manager = Some(registry.bind(name, version.min(1), queue_handle, ()));
@@ -3051,12 +3265,155 @@ impl Dispatch<wl_registry::WlRegistry, ()> for RuntimeState {
                     queue_handle,
                     OutputData { global_name: name },
                 );
-                state.outputs.insert(name, OutputRecord { proxy, name: None });
+                state.outputs.insert(
+                    name,
+                    OutputRecord { proxy, name: None, xdg_output: None, logical_position: None, logical_size: None },
+                );
+                bind_xdg_outputs(state, queue_handle);
             }
             wl_registry::Event::GlobalRemove { name } => {
-                state.outputs.remove(&name);
+                if let Some(output) = state.outputs.remove(&name)
+                    && let Some(xdg_output) = output.xdg_output
+                {
+                    xdg_output.destroy();
+                }
+                remove_pin_output(state, name, connection, queue_handle);
             }
             _ => {}
+        }
+    }
+}
+
+fn bind_xdg_outputs(state: &mut RuntimeState, queue_handle: &QueueHandle<RuntimeState>) {
+    if let Some(manager) = state.xdg_output_manager.as_ref() {
+        for (global_name, output) in &mut state.outputs {
+            if output.xdg_output.is_none() {
+                output.xdg_output =
+                    Some(manager.get_xdg_output(&output.proxy, queue_handle, OutputData { global_name: *global_name }));
+            }
+        }
+    }
+}
+
+fn remove_pin_output(
+    state: &mut RuntimeState,
+    global_name: u32,
+    connection: &Connection,
+    queue_handle: &QueueHandle<RuntimeState>,
+) {
+    let Some(pin) = state.pinned_image.as_mut() else { return };
+    if let Some(index) = pin.views.iter().position(|view| view.global_name == global_name) {
+        pin.views.remove(index).destroy();
+        if pin.pointer_output == Some(global_name) {
+            pin.pointer_output = None;
+            pin.interaction.leave();
+        }
+        if pin.views.is_empty() {
+            state.outcome = Some(RuntimeOutcome::Pinned);
+        } else {
+            pin.interaction.update_outputs(pin.views.iter().map(|view| view.logical).collect());
+            if let Some(compositor) = state.compositor.as_ref() {
+                pin.present(compositor, queue_handle);
+            }
+        }
+        if let Err(error) = connection.flush() {
+            state.runtime_error = Some(CaptureError::BackendFailure(format!("updating pin outputs failed: {error}")));
+        }
+    }
+}
+
+fn add_pin_output(
+    state: &mut RuntimeState,
+    global_name: u32,
+    queue_handle: &QueueHandle<RuntimeState>,
+) -> Result<(), CaptureError> {
+    if state.pinned_image.as_ref().is_none_or(|pin| pin.views.iter().any(|view| view.global_name == global_name)) {
+        return Ok(());
+    }
+    let Some(output) = state.outputs.get(&global_name) else { return Ok(()) };
+    let (Some((x, y)), Some(size)) = (output.logical_position, output.logical_size) else { return Ok(()) };
+    let logical = AnnotationRect { x, y, width: size.width as i32, height: size.height as i32 };
+    if logical.x.checked_add(logical.width).is_none() || logical.y.checked_add(logical.height).is_none() {
+        return Err(CaptureError::InvalidFrame("pin output coordinates exceed protocol range".into()));
+    }
+    let spec = PinOutputSpec { global_name, proxy: output.proxy.clone(), logical, source: false };
+    let (
+        Some(compositor),
+        Some(subcompositor),
+        Some(shm),
+        Some(viewporter),
+        Some(layer_shell),
+        Some(parent),
+        Some(viewport),
+    ) = (
+        state.compositor.as_ref(),
+        state.subcompositor.as_ref(),
+        state.shm.as_ref(),
+        state.viewporter.as_ref(),
+        state.layer_shell.as_ref(),
+        state.editor_surface.as_ref(),
+        state.editor_viewport.as_ref(),
+    )
+    else {
+        return Err(CaptureError::BackendFailure("missing Wayland objects for new pin output".into()));
+    };
+    let factory = EditorLayerFactory { compositor, subcompositor, shm, parent, size, queue_handle };
+    let view = PinOutputView::new(&factory, viewporter, layer_shell, &spec, viewport);
+    if let Some(pin) = state.pinned_image.as_mut() {
+        pin.views.push(view);
+        pin.interaction.update_outputs(pin.views.iter().map(|view| view.logical).collect());
+    }
+    Ok(())
+}
+
+impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for RuntimeState {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        _: zxdg_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zxdg_output_v1::ZxdgOutputV1, OutputData> for RuntimeState {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_output_v1::ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        data: &OutputData,
+        connection: &Connection,
+        queue_handle: &QueueHandle<Self>,
+    ) {
+        let Some(output) = state.outputs.get_mut(&data.global_name) else { return };
+        match event {
+            zxdg_output_v1::Event::LogicalPosition { x, y } => output.logical_position = Some((x, y)),
+            zxdg_output_v1::Event::LogicalSize { width, height } if width > 0 && height > 0 => {
+                output.logical_size = Some(PixelSize { width: width as u32, height: height as u32 });
+            }
+            zxdg_output_v1::Event::Name { name } if output.name.is_none() => output.name = Some(name),
+            _ => {}
+        }
+        let position = output.logical_position;
+        if let Err(error) = add_pin_output(state, data.global_name, queue_handle) {
+            state.runtime_error = Some(error);
+            return;
+        }
+        if let (Some(pin), Some((x, y))) = (state.pinned_image.as_mut(), position)
+            && let Some(view) = pin.views.iter_mut().find(|view| view.global_name == data.global_name)
+        {
+            view.logical.x = x;
+            view.logical.y = y;
+            pin.interaction.update_outputs(pin.views.iter().map(|view| view.logical).collect());
+            if let Some(compositor) = state.compositor.as_ref() {
+                pin.present(compositor, queue_handle);
+            }
+            if let Err(error) = connection.flush() {
+                state.runtime_error =
+                    Some(CaptureError::BackendFailure(format!("updating logical pin layout failed: {error}")));
+            }
         }
     }
 }
@@ -3210,15 +3567,21 @@ fn handle_pinned_pointer(
     let Some(pin) = state.pinned_image.as_mut() else { return };
     let mut moved = false;
     match event {
-        wl_pointer::Event::Enter { serial, surface_x, surface_y, .. } => {
+        wl_pointer::Event::Enter { serial, surface, surface_x, surface_y, .. } => {
             state.pointer_enter_serial = Some(serial);
-            moved = pin.interaction.motion((surface_x, surface_y));
+            pin.pointer_output = pin.views.iter().find(|view| view.parent == surface).map(|view| view.global_name);
+            if let Some(point) = pin.pointer_position((surface_x, surface_y)) {
+                moved = pin.interaction.motion(point);
+            }
         }
         wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
-            moved = pin.interaction.motion((surface_x, surface_y));
+            if let Some(point) = pin.pointer_position((surface_x, surface_y)) {
+                moved = pin.interaction.motion(point);
+            }
         }
         wl_pointer::Event::Leave { .. } => {
             state.pointer_enter_serial = None;
+            pin.pointer_output = None;
             pin.interaction.leave();
         }
         wl_pointer::Event::Button {
@@ -3231,7 +3594,7 @@ fn handle_pinned_pointer(
         wl_pointer::Event::Button {
             button: BTN_LEFT, state: WEnum::Value(wl_pointer::ButtonState::Released), ..
         } => {
-            pin.interaction.release();
+            moved = pin.interaction.release();
         }
         wl_pointer::Event::Button {
             button: BTN_RIGHT, state: WEnum::Value(wl_pointer::ButtonState::Pressed), ..
@@ -3240,8 +3603,8 @@ fn handle_pinned_pointer(
         }
         _ => {}
     }
-    if moved && let (Some(compositor), Some(parent)) = (state.compositor.as_ref(), state.editor_surface.as_ref()) {
-        pin.present(compositor, parent, queue_handle);
+    if moved && let Some(compositor) = state.compositor.as_ref() {
+        pin.present(compositor, queue_handle);
     }
     if let (Some(device), Some(serial)) = (state.cursor_shape_device.as_ref(), state.pointer_enter_serial) {
         use wp_cursor_shape_device_v1::Shape;
@@ -3447,12 +3810,6 @@ impl Dispatch<wl_buffer::WlBuffer, CanvasBufferData> for RuntimeState {
         _queue_handle: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
-            if data.layer == EditorLayerKind::PinnedHeader {
-                if let Some(pin) = state.pinned_image.as_mut() {
-                    pin.header.mark_released(data.slot);
-                }
-                return;
-            }
             if data.layer == EditorLayerKind::Feedback {
                 if let Some(layer) = state.feedback_layer.as_mut() {
                     // A retired editor feedback buffer can release after the
@@ -3585,17 +3942,82 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for RuntimeState {
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for RuntimeState {
     fn event(
         state: &mut Self,
-        _proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
         _data: &(),
-        _connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
+        connection: &Connection,
+        queue_handle: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
-                state.configure = Some((serial, width, height));
+                if let Some(global_name) = state.pinned_image.as_ref().and_then(|pin| {
+                    pin.views.iter().find(|view| view.layer_surface.is_none()).map(|view| view.global_name)
+                }) {
+                    proxy.ack_configure(serial);
+                    configure_pin_output(state, global_name, width, height, connection, queue_handle);
+                } else {
+                    state.configure = Some((serial, width, height));
+                }
+            }
+            zwlr_layer_surface_v1::Event::Closed if state.pinned_image.is_some() => {
+                if let Some(global_name) = state.pinned_image.as_ref().and_then(|pin| {
+                    pin.views.iter().find(|view| view.layer_surface.is_none()).map(|view| view.global_name)
+                }) {
+                    remove_pin_output(state, global_name, connection, queue_handle);
+                }
             }
             zwlr_layer_surface_v1::Event::Closed if state.completion_toast.is_none() => state.closed = true,
+            _ => {}
+        }
+    }
+}
+
+fn configure_pin_output(
+    state: &mut RuntimeState,
+    global_name: u32,
+    width: u32,
+    height: u32,
+    connection: &Connection,
+    queue_handle: &QueueHandle<RuntimeState>,
+) {
+    let Some(pin) = state.pinned_image.as_mut() else { return };
+    let Some(view) = pin.views.iter_mut().find(|view| view.global_name == global_name) else { return };
+    let width = if width == 0 { view.logical.width } else { i32::try_from(width).unwrap_or(0) };
+    let height = if height == 0 { view.logical.height } else { i32::try_from(height).unwrap_or(0) };
+    if width <= 0 || height <= 0 {
+        state.runtime_error = Some(CaptureError::InvalidFrame("invalid pin output configure size".into()));
+        return;
+    }
+    view.logical.width = width;
+    view.logical.height = height;
+    view.viewport.set_destination(width, height);
+    view.configured = true;
+    pin.interaction.update_outputs(pin.views.iter().map(|view| view.logical).collect());
+    if let Some(compositor) = state.compositor.as_ref() {
+        pin.present(compositor, queue_handle);
+    }
+    if let Err(error) = connection.flush() {
+        state.runtime_error = Some(CaptureError::BackendFailure(format!("configuring pin output failed: {error}")));
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, PinOutputData> for RuntimeState {
+    fn event(
+        state: &mut Self,
+        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        data: &PinOutputData,
+        connection: &Connection,
+        queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                proxy.ack_configure(serial);
+                configure_pin_output(state, data.global_name, width, height, connection, queue_handle);
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                remove_pin_output(state, data.global_name, connection, queue_handle)
+            }
             _ => {}
         }
     }
